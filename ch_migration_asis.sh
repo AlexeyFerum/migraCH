@@ -1,6 +1,14 @@
 #!/bin/bash
 
-# Configuration
+# ============================================================
+# ClickHouse Cross-Cluster Migration Script
+# Transfers data from one physical ClickHouse cluster to another.
+# All MergeTree-family engines are converted to their Replicated
+# counterparts so the destination cluster can run in fault-tolerant
+# mode (each shard has at least one replica).
+# ============================================================
+
+# --------------- Configuration ---------------
 OLD_CLUSTER_HOST="localhost"
 OLD_CLUSTER_PORT="19000"
 OLD_CLICKHOUSE_USER="default"
@@ -12,13 +20,22 @@ NEW_CLICKHOUSE_USER="default"
 NEW_CLICKHOUSE_PASSWORD="changeme"
 
 CLUSTER_NAME="epm_cluster"
-BACKUP_DIR="/Users/alexey_zheleznoy/Desktop/jobs/clickhouse/my_ch/backup"
-LOG_FILE="/Users/alexey_zheleznoy/Desktop/jobs/clickhouse/my_ch/clickhouse-migration.log"
+BACKUP_DIR="/var/lib/clickhouse/migration_backup"
+LOG_FILE="/var/log/clickhouse-migration.log"
+
+# ZooKeeper path prefix template for ReplicatedMergeTree tables.
+# Available placeholders (resolved by ClickHouse macros on each node):
+#   {cluster}   – cluster name macro
+#   {shard}     – shard number macro
+#   {replica}   – replica name macro
+# The table-level path is constructed as:
+#   $ZK_PATH_PREFIX/{database}/{table}/{shard}
+ZK_PATH_PREFIX="/clickhouse/{cluster}"
 
 # Exclude system databases
 EXCLUDED_DATABASES="'system', 'information_schema', 'INFORMATION_SCHEMA', 'default'"
 
-# Exclude system tables/views
+# Exclude system table engines
 EXCLUDED_TABLE_ENGINES="'dictionary', '%postgres%', '%view%'"
 
 # Colors for output
@@ -27,12 +44,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# Get timestamp with microseconds
+# -------- Helpers --------
+
 get_timestamp() {
     date '+%Y-%m-%d %H:%M:%S.%6N'
 }
 
-# Logging functions
 log() {
     local timestamp
     timestamp=$(get_timestamp)
@@ -61,15 +78,15 @@ warning() {
     echo "$timestamp - WARNING: $1" >> "$LOG_FILE"
 }
 
-# Function to execute queries in ClickHouse with proper error handling
+# -------- ClickHouse query wrappers --------
+
 clickhouse_query() {
     local host=$1
     local port=$2
     local user=$3
     local password=$4
     local query=$5
-    
-    # Execute query and capture both output and errors
+
     local output
     output=$(clickhouse client \
         --host="$host" \
@@ -78,49 +95,40 @@ clickhouse_query() {
         --password="$password" \
         --multiquery \
         -q "$query" 2>&1)
-    
+
     local exit_code=$?
-    
-    # Always log the full output
+
     if [ -n "$output" ]; then
-        # Log to file (without color codes for cleaner logs)
         echo "$output" | sed -r "s/\x1B\[[0-9;]*[JKmsu]//g" >> "$LOG_FILE"
     fi
-    
-    # If there was an error, extract meaningful error message
+
     if [ $exit_code -ne 0 ] && [ -n "$output" ]; then
-        # Extract ClickHouse error message (usually starts with "Code: ")
         local error_msg
         error_msg=$(echo "$output" | grep -o "Code: [0-9]\+.*" | head -1)
-        
-        if [ -z "$error_msg" ]; then
-            # If no standard error format, take the first non-empty line
-            error_msg=$(echo "$output" | grep -v "^$" | head -1)
-        fi
-        
-        # Output the error to stderr
+        [ -z "$error_msg" ] && error_msg=$(echo "$output" | grep -v "^$" | head -1)
         echo "$error_msg" >&2
     fi
-    
-    # Return output for successful queries
-    if [ $exit_code -eq 0 ]; then
-        echo "$output"
-    fi
-    
+
+    [ $exit_code -eq 0 ] && echo "$output"
     return $exit_code
 }
 
 clickhouse_query_old() {
-    local query=$1
-    clickhouse_query "$OLD_CLUSTER_HOST" "$OLD_CLUSTER_PORT" "$OLD_CLICKHOUSE_USER" "$OLD_CLICKHOUSE_PASSWORD" "$query"
+    clickhouse_query \
+        "$OLD_CLUSTER_HOST" "$OLD_CLUSTER_PORT" \
+        "$OLD_CLICKHOUSE_USER" "$OLD_CLICKHOUSE_PASSWORD" \
+        "$1"
 }
 
 clickhouse_query_new() {
-    local query=$1
-    clickhouse_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT" "$NEW_CLICKHOUSE_USER" "$NEW_CLICKHOUSE_PASSWORD" "$query"
+    clickhouse_query \
+        "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT" \
+        "$NEW_CLICKHOUSE_USER" "$NEW_CLICKHOUSE_PASSWORD" \
+        "$1"
 }
 
-# Check connections
+# -------- Pre-flight checks --------
+
 check_connections() {
     log "Checking connection to old cluster..."
     if clickhouse_query_old "SELECT hostname()" >/dev/null 2>&1; then
@@ -137,163 +145,101 @@ check_connections() {
     fi
 }
 
-# Create backup directory
+# Verify that the ClickHouse macro substitutions required by
+# ReplicatedMergeTree are defined on the new cluster nodes.
+check_replication_macros() {
+    log "Checking replication macros on new cluster..."
+
+    local shard_macro
+    shard_macro=$(clickhouse_query_new "SELECT getMacro('shard')" 2>/dev/null | tr -d '[:space:]')
+
+    local replica_macro
+    replica_macro=$(clickhouse_query_new "SELECT getMacro('replica')" 2>/dev/null | tr -d '[:space:]')
+
+    local cluster_macro
+    cluster_macro=$(clickhouse_query_new "SELECT getMacro('cluster')" 2>/dev/null | tr -d '[:space:]')
+
+    local missing=0
+
+    if [ -z "$shard_macro" ] || [ "$shard_macro" = "shard" ]; then
+        warning "  Macro 'shard' is not defined on the new cluster. ReplicatedMergeTree tables will fail to create."
+        missing=1
+    else
+        log "  Macro 'shard'   = $shard_macro"
+    fi
+
+    if [ -z "$replica_macro" ] || [ "$replica_macro" = "replica" ]; then
+        warning "  Macro 'replica' is not defined on the new cluster. ReplicatedMergeTree tables will fail to create."
+        missing=1
+    else
+        log "  Macro 'replica' = $replica_macro"
+    fi
+
+    if [ -z "$cluster_macro" ] || [ "$cluster_macro" = "cluster" ]; then
+        warning "  Macro 'cluster' is not defined. ZooKeeper paths using {cluster} will be literal strings."
+    else
+        log "  Macro 'cluster' = $cluster_macro"
+    fi
+
+    if [ $missing -eq 1 ]; then
+        error "Required ClickHouse macros are missing on the new cluster. " \
+              "Add 'shard' and 'replica' macros to /etc/clickhouse-server/config.d/macros.xml on every new-cluster node and restart ClickHouse before retrying."
+    fi
+
+    success "Replication macros verified"
+}
+
+# -------- Backup directory --------
+
 create_backup_dir() {
     log "Creating backup directory..."
     mkdir -p "$BACKUP_DIR/ddl" "$BACKUP_DIR/data"
     chown -R clickhouse:clickhouse "$BACKUP_DIR" 2>/dev/null || true
 }
 
-# Function to fix escaped characters in DDL files
+# -------- DDL helpers --------
+
 fix_escaped_chars_in_ddl() {
     local file_path=$1
-    
-    if [ ! -f "$file_path" ]; then
-        return 1
-    fi
-    
-    # Read the file content
+    [ -f "$file_path" ] || return 1
+
     local content
     content=$(cat "$file_path")
-    
-    # Replace escaped quotes with regular quotes
     content=$(echo "$content" | sed "s/\\\\'/'/g")
-    
-    # Replace escaped backslashes with single backslashes
     content=$(echo "$content" | sed 's/\\\\/\\/g')
-    
-    # Write fixed content back
     echo "$content" > "$file_path"
 }
 
-export_tables() {
-    local db=$1
-    local tables
-
-    tables=$(clickhouse_query_old \
-        "SELECT name FROM system.tables WHERE database = '$db' AND engine NOT ILIKE '%view%' \
-            AND engine NOT ILIKE 'dictionary' AND engine NOT ILIKE '%postgres%'")
-    
-    for table in $tables; do
-        log "  Exporting table: $table"
-        clickhouse_query_old \
-            "SHOW CREATE TABLE $db.\`$table\`" > "$BACKUP_DIR/ddl/$db/$table.sql"
-        
-        # Fix escaped characters in DDL
-        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/$table.sql"
-    done
-}
-
-export_views() {
-    local db=$1
-    local views
-
-    views=$(clickhouse_query_old \
-        "SELECT name FROM system.tables WHERE database = '$db' AND engine ILIKE '%view%'")
-    
-    for view in $views; do
-        log "  Exporting view: $view"
-        clickhouse_query_old \
-            "SHOW CREATE TABLE $db.\`$view\`" > "$BACKUP_DIR/ddl/$db/$view.view.sql"
-        
-        # Fix escaped characters in DDL
-        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/$view.view.sql"
-    done
-}
-
-export_dictionaries() {
-    local db=$1
-    local dicts
-
-    dicts=$(clickhouse_query_old \
-        "SELECT name FROM system.dictionaries WHERE database = '$db'")
-    
-    for dict in $dicts; do
-        log "  Exporting dictionary: $dict"
-        clickhouse_query_old \
-            "SHOW CREATE DICTIONARY $db.$dict" > "$BACKUP_DIR/ddl/$db/$dict.dict.sql"
-        
-        # Fix escaped characters in DDL
-        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/$dict.dict.sql"
-    done
-}
-
-# 1. Export DDL
-export_ddl() {
-    log "=== Step 1: Exporting DDL ==="
-    
-    # Export list of databases (excluding system databases)
-    local databases
-    databases=$(clickhouse_query_old \
-        "SELECT name FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)")
-    
-    if [ -z "$databases" ]; then
-        warning "No non-system databases found"
-        return 0
-    fi
-    
-    for db in $databases; do
-        log "Exporting database: $db"
-        
-        mkdir -p "$BACKUP_DIR/ddl/$db"
-        clickhouse_query_old \
-            "SHOW CREATE DATABASE $db" > "$BACKUP_DIR/ddl/$db/database.sql"
-        
-        # Fix escaped characters in database DDL
-        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/database.sql"
-        
-        export_tables "$db"
-        export_views "$db"
-        export_dictionaries "$db"
-    done
-    
-    success "DDL export completed"
-}
-
-# Function to add ON CLUSTER clause to DDL
+# Add "ON CLUSTER <name>" to a CREATE statement that does not already have it.
 add_on_cluster_to_ddl() {
     local file_path=$1
     local entity_type=$2
     local db_name=$3
     local entity_name=$4
-    
-    if [ ! -f "$file_path" ]; then
-        warning "File $file_path does not exist"
-        return 1
-    fi
-    
+
+    [ -f "$file_path" ] || { warning "File $file_path does not exist"; return 1; }
+
     log "  Adding ON CLUSTER to $entity_type: $db_name.$entity_name"
-    
-    # Read the file content
+
     local content
     content=$(cat "$file_path")
-    
-    # Remove escape sequences like \n, \t
     content=$(echo -e "$content")
-    
-    # Check if ON CLUSTER already exists
+
     if echo "$content" | grep -qi "ON CLUSTER"; then
         log "    ON CLUSTER already present"
         return 0
     fi
-    
-    # Split into lines
+
     local lines=()
     while IFS= read -r line; do
         lines+=("$line")
     done <<< "$content"
-    
-    # Process CREATE statement line
-    if [[ ${lines[0]} =~ ^CREATE[[:space:]]+(DATABASE|TABLE|VIEW|DICTIONARY) ]]; then
-        # Add ON CLUSTER after the entity name in the first line
-        if [[ ${lines[0]} =~ ^(CREATE[[:space:]]+[A-Z]+[[:space:]]+[^[:space:]]+)(.*) ]]; then
+
+    if [[ ${lines[0]} =~ ^CREATE[[:space:]]+(DATABASE|TABLE|VIEW|MATERIALIZED[[:space:]]+VIEW|DICTIONARY) ]]; then
+        if [[ ${lines[0]} =~ ^(CREATE[[:space:]]+[A-Z[:space:]]+[^[:space:]]+)(.*) ]]; then
             local create_part="${BASH_REMATCH[1]}"
             local rest_part="${BASH_REMATCH[2]}"
-            
-            # Add ON CLUSTER after the entity name
-            lines[0]="${create_part} ON CLUSTER $CLUSTER_NAME${rest_part}"
-            
-            # Write back to file
+            lines[0]="${create_part} ON CLUSTER ${CLUSTER_NAME}${rest_part}"
             printf "%s\n" "${lines[@]}" > "$file_path"
             log "    Successfully added ON CLUSTER $CLUSTER_NAME"
         else
@@ -306,492 +252,692 @@ add_on_cluster_to_ddl() {
     fi
 }
 
-# 2. Apply DDL to new cluster
+# ---------------------------------------------------------------------------
+# convert_engine_to_replicated  –  core of the new functionality
+#
+# Rewrites the ENGINE clause in a table DDL file so that every MergeTree
+# family engine becomes its Replicated* counterpart.
+#
+# Handled variants (non-exhaustive but covers all built-in ClickHouse engines):
+#   MergeTree                    -> ReplicatedMergeTree
+#   SummingMergeTree             -> ReplicatedSummingMergeTree
+#   AggregatingMergeTree         -> ReplicatedAggregatingMergeTree
+#   CollapsingMergeTree          -> ReplicatedCollapsingMergeTree
+#   ReplacingMergeTree           -> ReplicatedReplacingMergeTree
+#   VersionedCollapsingMergeTree -> ReplicatedVersionedCollapsingMergeTree
+#   GraphiteMergeTree            -> ReplicatedGraphiteMergeTree
+#
+# Already-Replicated engines:    path is rewritten to the new ZK convention,
+#                                 other arguments are preserved.
+# Non-MergeTree engines:         file is left unchanged.
+# ---------------------------------------------------------------------------
+convert_engine_to_replicated() {
+    local file_path=$1
+    local db_name=$2
+    local table_name=$3
+
+    [ -f "$file_path" ] || { warning "File $file_path does not exist"; return 1; }
+
+    local content
+    content=$(cat "$file_path")
+
+    # Build the ZooKeeper path for this table.
+    # Pattern:  /clickhouse/{cluster}/{database}/{table}/{shard}
+    local zk_path="${ZK_PATH_PREFIX}/${db_name}/${table_name}/{shard}"
+    local zk_replica="{replica}"
+
+    # ------------------------------------------------------------------
+    # Case 1: already a Replicated* engine
+    #   ENGINE = ReplicatedMergeTree('/old/path', '{replica}' [, extra_args])
+    # We keep the engine name and extra_args; only replace the ZK path
+    # and replica arguments.
+    # ------------------------------------------------------------------
+    if echo "$content" | grep -qiP "ENGINE\s*=\s*Replicated\w*MergeTree"; then
+        log "    Engine is already Replicated*MergeTree – rewriting ZK path"
+
+        # Replace the first two string arguments (path, replica) while
+        # preserving any additional arguments that follow.
+        # Handles both forms:
+        #   ReplicatedMergeTree('/path', '{replica}')
+        #   ReplicatedMergeTree('/path', '{replica}', version_col)
+        content=$(echo "$content" | perl -pe \
+            "s|(ENGINE\s*=\s*Replicated\w*MergeTree\s*\()('[^']*'\s*,\s*'[^']*')|\${1}'${zk_path}', '${zk_replica}'|i")
+
+        echo "$content" > "$file_path"
+        log "    ZK path rewritten to: $zk_path"
+        return 0
+    fi
+
+    # ------------------------------------------------------------------
+    # Case 2: plain MergeTree-family engine (not yet Replicated)
+    #   ENGINE = SummingMergeTree(...)   or   ENGINE = MergeTree()
+    # ------------------------------------------------------------------
+    # Extract the engine variant name (the part between "ENGINE = " and "(")
+    local engine_variant
+    engine_variant=$(echo "$content" | grep -oiP "ENGINE\s*=\s*\K(Summing|Aggregating|Collapsing|Replacing|VersionedCollapsing|Graphite)?MergeTree" | head -1)
+
+    if [ -z "$engine_variant" ]; then
+        log "    Engine is not a MergeTree family – skipping conversion"
+        return 0
+    fi
+
+    log "    Converting $engine_variant -> Replicated${engine_variant}"
+
+    # Extract any existing engine parameters (everything inside the outer
+    # parentheses after the engine name).  We must preserve them because
+    # some variants carry required arguments (e.g. CollapsingMergeTree
+    # needs a sign column, ReplacingMergeTree needs an optional version col).
+    #
+    # Strategy: capture text between the FIRST '(' and its matching ')'.
+    # We use Python for reliable paren-matching since bash/sed cannot count
+    # nested parentheses.
+    local extra_args
+    extra_args=$(python3 - "$engine_variant" <<'PYEOF'
+import sys, re
+
+variant = sys.argv[1]
+# Read from stdin
+content = sys.stdin.read()
+
+# Find ENGINE = <Variant>MergeTree( ... )
+pattern = re.compile(
+    r'ENGINE\s*=\s*' + re.escape(variant) + r'MergeTree\s*\(([^)]*)\)',
+    re.IGNORECASE
+)
+m = pattern.search(content)
+if m:
+    print(m.group(1).strip())
+PYEOF
+<<< "$content")
+
+    # Build the new ENGINE clause.
+    # ReplicatedMergeTree (and variants) always take (zk_path, replica)
+    # as the first two arguments.  Extra variant-specific args come after.
+    local new_engine_call
+    if [ -n "$extra_args" ]; then
+        new_engine_call="Replicated${engine_variant}('${zk_path}', '${zk_replica}', ${extra_args})"
+    else
+        new_engine_call="Replicated${engine_variant}('${zk_path}', '${zk_replica}')"
+    fi
+
+    # Replace the old ENGINE clause in the DDL.
+    content=$(echo "$content" | perl -pe \
+        "s|ENGINE\s*=\s*${engine_variant}MergeTree\s*\([^)]*\)|ENGINE = ${new_engine_call}|i")
+
+    echo "$content" > "$file_path"
+    log "    Engine rewritten to: ENGINE = $new_engine_call"
+    return 0
+}
+
+# -------- Export phase --------
+
+export_tables() {
+    local db=$1
+    local tables
+    tables=$(clickhouse_query_old \
+        "SELECT name FROM system.tables WHERE database = '$db'
+         AND engine NOT ILIKE '%view%'
+         AND engine NOT ILIKE 'dictionary'
+         AND engine NOT ILIKE '%postgres%'")
+
+    for table in $tables; do
+        log "  Exporting table: $table"
+        clickhouse_query_old \
+            "SHOW CREATE TABLE \`$db\`.\`$table\`" \
+            > "$BACKUP_DIR/ddl/$db/$table.sql"
+        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/$table.sql"
+    done
+}
+
+export_views() {
+    local db=$1
+    local views
+    views=$(clickhouse_query_old \
+        "SELECT name FROM system.tables WHERE database = '$db' AND engine ILIKE '%view%'")
+
+    for view in $views; do
+        log "  Exporting view: $view"
+        clickhouse_query_old \
+            "SHOW CREATE TABLE \`$db\`.\`$view\`" \
+            > "$BACKUP_DIR/ddl/$db/$view.view.sql"
+        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/$view.view.sql"
+    done
+}
+
+export_dictionaries() {
+    local db=$1
+    local dicts
+    dicts=$(clickhouse_query_old \
+        "SELECT name FROM system.dictionaries WHERE database = '$db'")
+
+    for dict in $dicts; do
+        log "  Exporting dictionary: $dict"
+        clickhouse_query_old \
+            "SHOW CREATE DICTIONARY \`$db\`.\`$dict\`" \
+            > "$BACKUP_DIR/ddl/$db/$dict.dict.sql"
+        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/$dict.dict.sql"
+    done
+}
+
+# Step 1: Export all DDL from the old cluster.
+export_ddl() {
+    log "=== Step 1: Exporting DDL ==="
+
+    local databases
+    databases=$(clickhouse_query_old \
+        "SELECT name FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)")
+
+    if [ -z "$databases" ]; then
+        warning "No non-system databases found"
+        return 0
+    fi
+
+    for db in $databases; do
+        log "Exporting database: $db"
+        mkdir -p "$BACKUP_DIR/ddl/$db"
+
+        clickhouse_query_old "SHOW CREATE DATABASE \`$db\`" \
+            > "$BACKUP_DIR/ddl/$db/database.sql"
+        fix_escaped_chars_in_ddl "$BACKUP_DIR/ddl/$db/database.sql"
+
+        export_tables "$db"
+        export_views "$db"
+        export_dictionaries "$db"
+    done
+
+    success "DDL export completed"
+}
+
+# -------- Apply phase --------
+
+# Step 2: Apply (modified) DDL to the new cluster.
 apply_ddl() {
     log "=== Step 2: Applying DDL to new cluster ==="
-    
+
     local has_errors=0
-    
-    # Apply database DDL
+
+    # -- Databases --
     for db_dir in "$BACKUP_DIR/ddl"/*/; do
-        if [ -d "$db_dir" ]; then
-            local db_name
-            db_name=$(basename "$db_dir")
-            local db_sql="$db_dir/database.sql"
-            
-            if [ -f "$db_sql" ]; then
-                # Add ON CLUSTER clause
-                if ! add_on_cluster_to_ddl "$db_sql" "database" "$db_name" ""; then
-                    warning "Failed to modify DDL for database: $db_name"
-                    has_errors=1
-                    continue
-                fi
-                
-                log "Creating database: $db_name"
-                
-                # Read the SQL from file
-                local sql_statement
-                sql_statement=$(cat "$db_sql")
-                
-                # Execute and check result
-                if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
-                    # Get the actual error from the last query
-                    local error_msg
-                    error_msg=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
-                    
-                    if [ -z "$error_msg" ]; then
-                        error_msg="Unknown error (check $LOG_FILE for details)"
-                    fi
-                    
-                    warning "Failed to create database '$db_name': $error_msg"
-                    has_errors=1
-                else
-                    log "  Successfully created database: $db_name"
-                fi
-            else
-                warning "Database DDL file not found for: $db_name"
-                has_errors=1
-            fi
+        [ -d "$db_dir" ] || continue
+        local db_name
+        db_name=$(basename "$db_dir")
+        local db_sql="$db_dir/database.sql"
+
+        [ -f "$db_sql" ] || { warning "Database DDL not found for: $db_name"; has_errors=1; continue; }
+
+        if ! add_on_cluster_to_ddl "$db_sql" "database" "$db_name" ""; then
+            warning "Failed to modify DDL for database: $db_name"
+            has_errors=1
+            continue
+        fi
+
+        log "Creating database: $db_name"
+        local sql_statement
+        sql_statement=$(cat "$db_sql")
+
+        if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
+            local err
+            err=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
+            warning "Failed to create database '$db_name': ${err:-unknown error}"
+            has_errors=1
+        else
+            log "  Successfully created database: $db_name"
         fi
     done
-    
-    if [ $has_errors -eq 0 ]; then
-        # Apply tables DDL
-        apply_tables
-        
-        # Apply views DDL
-        apply_views
-        
-        # Apply dictionaries DDL
-        apply_dictionaries
-    else
-        error "Stopping DDL application due to previous errors"
+
+    if [ $has_errors -ne 0 ]; then
+        error "Stopping DDL application due to database creation errors"
     fi
-    
+
+    apply_tables
+    apply_views
+    apply_dictionaries
+
     success "DDL application completed"
 }
 
 apply_tables() {
     log "Applying tables..."
-    
     local has_errors=0
+
     for db_dir in "$BACKUP_DIR/ddl"/*/; do
-        if [ -d "$db_dir" ]; then
-            local db_name
-            db_name=$(basename "$db_dir")
-            
-            for table_sql in "$db_dir"/*.sql; do
-                if [ -f "$table_sql" ]; then
-                    local filename
-                    filename=$(basename "$table_sql")
-                    
-                    # Skip non-table files
-                    if [[ "$filename" == "database.sql" ]] || \
-                       [[ "$filename" == *".view.sql" ]] || \
-                       [[ "$filename" == *".dict.sql" ]]; then
-                        continue
-                    fi
-                    
-                    local table_name
-                    table_name=$(basename "$table_sql" .sql)
-                    
-                    # Add ON CLUSTER clause
-                    if ! add_on_cluster_to_ddl "$table_sql" "table" "$db_name" "$table_name"; then
-                        warning "Failed to modify DDL for table: $db_name.$table_name"
-                        has_errors=1
-                        continue
-                    fi
-                    
-                    log "  Creating table: $db_name.$table_name"
-                    
-                    # Read the SQL from file
-                    local sql_statement
-                    sql_statement=$(cat "$table_sql")
-                    
-                    # Execute and check result
-                    if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
-                        local error_msg
-                        error_msg=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
-                        
-                        if [ -z "$error_msg" ]; then
-                            error_msg="Unknown error (check $LOG_FILE for details)"
-                        fi
-                        
-                        warning "Failed to create table '$db_name.$table_name': $error_msg"
-                        has_errors=1
-                    else
-                        log "    Successfully created table: $db_name.$table_name"
-                    fi
-                fi
-            done
-        fi
+        [ -d "$db_dir" ] || continue
+        local db_name
+        db_name=$(basename "$db_dir")
+
+        for table_sql in "$db_dir"*.sql; do
+            [ -f "$table_sql" ] || continue
+            local filename
+            filename=$(basename "$table_sql")
+
+            # Skip non-table files
+            [[ "$filename" == "database.sql"  ]] && continue
+            [[ "$filename" == *.view.sql      ]] && continue
+            [[ "$filename" == *.dict.sql      ]] && continue
+
+            local table_name
+            table_name=$(basename "$table_sql" .sql)
+
+            # 1) Inject ON CLUSTER
+            if ! add_on_cluster_to_ddl "$table_sql" "table" "$db_name" "$table_name"; then
+                warning "Failed to add ON CLUSTER for table: $db_name.$table_name"
+                has_errors=1
+                continue
+            fi
+
+            # 2) Convert MergeTree engine to ReplicatedMergeTree
+            if ! convert_engine_to_replicated "$table_sql" "$db_name" "$table_name"; then
+                warning "Failed to convert engine for table: $db_name.$table_name"
+                has_errors=1
+                continue
+            fi
+
+            log "  Creating table: $db_name.$table_name"
+            local sql_statement
+            sql_statement=$(cat "$table_sql")
+
+            if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
+                local err
+                err=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
+                warning "Failed to create table '$db_name.$table_name': ${err:-unknown error}"
+                has_errors=1
+            else
+                log "    Successfully created table: $db_name.$table_name"
+            fi
+        done
     done
-    
+
     [ $has_errors -eq 0 ] || warning "Some tables failed to create"
 }
 
 apply_views() {
     log "Applying views..."
-    
     local has_errors=0
+
     for db_dir in "$BACKUP_DIR/ddl"/*/; do
-        if [ -d "$db_dir" ]; then
-            local db_name
-            db_name=$(basename "$db_dir")
-            
-            for view_sql in "$db_dir"/*.view.sql; do
-                if [ -f "$view_sql" ]; then
-                    local view_name
-                    view_name=$(basename "$view_sql" .view.sql)
-                    
-                    # Add ON CLUSTER clause
-                    if ! add_on_cluster_to_ddl "$view_sql" "view" "$db_name" "$view_name"; then
-                        warning "Failed to modify DDL for view: $db_name.$view_name"
-                        has_errors=1
-                        continue
-                    fi
-                    
-                    log "  Creating view: $db_name.$view_name"
-                    
-                    # Read the SQL from file
-                    local sql_statement
-                    sql_statement=$(cat "$view_sql")
-                    
-                    # Execute and check result
-                    if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
-                        local error_msg
-                        error_msg=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
-                        
-                        if [ -z "$error_msg" ]; then
-                            error_msg="Unknown error (check $LOG_FILE for details)"
-                        fi
-                        
-                        warning "Failed to create view '$db_name.$view_name': $error_msg"
-                        has_errors=1
-                    else
-                        log "    Successfully created view: $db_name.$view_name"
-                    fi
-                fi
-            done
-        fi
+        [ -d "$db_dir" ] || continue
+        local db_name
+        db_name=$(basename "$db_dir")
+
+        for view_sql in "$db_dir"*.view.sql; do
+            [ -f "$view_sql" ] || continue
+            local view_name
+            view_name=$(basename "$view_sql" .view.sql)
+
+            if ! add_on_cluster_to_ddl "$view_sql" "view" "$db_name" "$view_name"; then
+                warning "Failed to modify DDL for view: $db_name.$view_name"
+                has_errors=1
+                continue
+            fi
+
+            log "  Creating view: $db_name.$view_name"
+            local sql_statement
+            sql_statement=$(cat "$view_sql")
+
+            if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
+                local err
+                err=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
+                warning "Failed to create view '$db_name.$view_name': ${err:-unknown error}"
+                has_errors=1
+            else
+                log "    Successfully created view: $db_name.$view_name"
+            fi
+        done
     done
-    
+
     [ $has_errors -eq 0 ] || warning "Some views failed to create"
 }
 
 apply_dictionaries() {
     log "Applying dictionaries..."
-    
     local has_errors=0
+
     for db_dir in "$BACKUP_DIR/ddl"/*/; do
-        if [ -d "$db_dir" ]; then
-            local db_name
-            db_name=$(basename "$db_dir")
-            
-            for dict_sql in "$db_dir"/*.dict.sql; do
-                if [ -f "$dict_sql" ]; then
-                    local dict_name
-                    dict_name=$(basename "$dict_sql" .dict.sql)
-                    
-                    # Add ON CLUSTER clause
-                    if ! add_on_cluster_to_ddl "$dict_sql" "dictionary" "$db_name" "$dict_name"; then
-                        warning "Failed to modify DDL for dictionary: $db_name.$dict_name"
-                        has_errors=1
-                        continue
-                    fi
-                    
-                    log "  Creating dictionary: $db_name.$dict_name"
-                    
-                    # Read the SQL from file
-                    local sql_statement
-                    sql_statement=$(cat "$dict_sql")
-                    
-                    # Execute and check result
-                    if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
-                        local error_msg
-                        error_msg=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
-                        
-                        if [ -z "$error_msg" ]; then
-                            error_msg="Unknown error (check $LOG_FILE for details)"
-                        fi
-                        
-                        warning "Failed to create dictionary '$db_name.$dict_name': $error_msg"
-                        has_errors=1
-                    else
-                        log "    Successfully created dictionary: $db_name.$dict_name"
-                    fi
-                fi
-            done
-        fi
+        [ -d "$db_dir" ] || continue
+        local db_name
+        db_name=$(basename "$db_dir")
+
+        for dict_sql in "$db_dir"*.dict.sql; do
+            [ -f "$dict_sql" ] || continue
+            local dict_name
+            dict_name=$(basename "$dict_sql" .dict.sql)
+
+            if ! add_on_cluster_to_ddl "$dict_sql" "dictionary" "$db_name" "$dict_name"; then
+                warning "Failed to modify DDL for dictionary: $db_name.$dict_name"
+                has_errors=1
+                continue
+            fi
+
+            log "  Creating dictionary: $db_name.$dict_name"
+            local sql_statement
+            sql_statement=$(cat "$dict_sql")
+
+            if ! clickhouse_query_new "$sql_statement" >/dev/null 2>&1; then
+                local err
+                err=$(clickhouse_query_new "$sql_statement" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
+                warning "Failed to create dictionary '$db_name.$dict_name': ${err:-unknown error}"
+                has_errors=1
+            else
+                log "    Successfully created dictionary: $db_name.$dict_name"
+            fi
+        done
     done
-    
+
     [ $has_errors -eq 0 ] || warning "Some dictionaries failed to create"
 }
 
-# 3. Data migration with two-phase approach
+# -------- Data migration --------
+
+# Step 3: Migrate data using INSERT … SELECT FROM remote().
 migrate_data() {
     log "=== Step 3: Data migration ==="
-    
-    # Get list of all non-system databases
+
     local databases
     databases=$(clickhouse_query_old \
         "SELECT name FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)")
-    
-    if [ -z "$databases" ]; then
-        warning "No databases to migrate"
-        return 0
-    fi
-    
+
+    [ -z "$databases" ] && { warning "No databases to migrate"; return 0; }
+
     local total_errors=0
-    
-    # Phase 1: Migrate distributed tables first
+
+    # Phase 1: distributed tables first (they read from underlying local tables)
     log "Phase 1: Migrating distributed tables..."
     for db in $databases; do
         log "Processing distributed tables in database: $db"
-        
-        # Get list of distributed tables
         local distributed_tables
         distributed_tables=$(clickhouse_query_old \
             "SELECT name FROM system.tables WHERE database = '$db' AND engine ILIKE 'Distributed%'")
-        
+
         if [ -n "$distributed_tables" ]; then
             for table in $distributed_tables; do
-                if ! migrate_table_data "$db" "$table"; then
-                    total_errors=$((total_errors + 1))
-                fi
+                migrate_table_data "$db" "$table" || total_errors=$((total_errors + 1))
             done
         else
             log "  No distributed tables found in $db"
         fi
     done
-    
-    # Phase 2: Migrate local tables
+
+    # Phase 2: local (non-distributed) tables
     log "Phase 2: Migrating local tables..."
     for db in $databases; do
         log "Processing local tables in database: $db"
-        
-        # Get list of local tables (excluding views, dictionaries, postgres and distributed tables)
         local local_tables
         local_tables=$(clickhouse_query_old \
-            "SELECT name FROM system.tables WHERE database = '$db' AND engine NOT ILIKE '%view%' \
-                AND engine NOT ILIKE 'dictionary' AND engine NOT ILIKE '%postgres%' \
-                AND engine NOT ILIKE 'Distributed%'")
-        
+            "SELECT name FROM system.tables WHERE database = '$db'
+             AND engine NOT ILIKE '%view%'
+             AND engine NOT ILIKE 'dictionary'
+             AND engine NOT ILIKE '%postgres%'
+             AND engine NOT ILIKE 'Distributed%'")
+
         if [ -n "$local_tables" ]; then
             for table in $local_tables; do
-                if ! migrate_table_data "$db" "$table"; then
-                    total_errors=$((total_errors + 1))
-                fi
+                migrate_table_data "$db" "$table" || total_errors=$((total_errors + 1))
             done
         else
             log "  No local tables found in $db"
         fi
     done
-    
+
     if [ $total_errors -eq 0 ]; then
         success "Data migration completed"
     else
-        warning "Data migration completed with $total_errors errors"
+        warning "Data migration completed with $total_errors error(s)"
     fi
 }
 
 migrate_table_data() {
     local db=$1
     local table=$2
-    
+
     log "  Migrating table: $db.$table"
-    
-    # Check if target table already has data
-    log "    Checking if target table has data..."
+
+    # Skip if target already has data
     local target_count=0
-    
-    # Try to get count from target table, handle errors gracefully
     local count_result
-    count_result=$(clickhouse_query_new "SELECT count() FROM $db.\`$table\`" 2>&1)
-    local count_exit_code=$?
-    
-    if [ $count_exit_code -eq 0 ]; then
-        target_count=$(echo "$count_result" | tr -d '\n' | tr -d '[:space:]')
-    else
-        # If table doesn't exist or other error, treat as empty
-        target_count=0
+    count_result=$(clickhouse_query_new "SELECT count() FROM \`$db\`.\`$table\`" 2>&1)
+    if [ $? -eq 0 ]; then
+        target_count=$(echo "$count_result" | tr -d '[:space:]')
     fi
-    
+
     if [ -n "$target_count" ] && [ "$target_count" -gt 0 ]; then
-        warning "    Target table $db.$table already contains $target_count rows. Skipping."
+        warning "    Target table $db.$table already has $target_count rows – skipping"
         return 0
     fi
-    
-    # Get row count from source for logging
+
+    # Source row count
     local row_count
-    row_count=$(clickhouse_query_old "SELECT count() FROM $db.\`$table\`" | tr -d '\n')
-    
-    # Handle empty tables
-    if [ -z "$row_count" ] || [ "$row_count" == "0" ]; then
-        log "    Table is empty, skipping"
+    row_count=$(clickhouse_query_old "SELECT count() FROM \`$db\`.\`$table\`" | tr -d '[:space:]')
+
+    if [ -z "$row_count" ] || [ "$row_count" = "0" ]; then
+        log "    Source table is empty – skipping"
         return 0
     fi
-    
-    log "    Total rows in source: $row_count"
-    
-    # For distributed tables, get underlying table count for better estimation
-    local engine
-    engine=$(clickhouse_query_old \
-        "SELECT engine FROM system.tables WHERE database = '$db' AND name = '$table'" | tr -d '\n')
-    
-    if echo "$engine" | grep -qi "Distributed"; then
-        log "    This is a distributed table"
-        # Get underlying tables if possible
-        local underlying_tables
-        underlying_tables=$(clickhouse_query_old \
-            "SELECT underlying_table FROM system.distributed_tables WHERE database = '$db' AND name = '$table'" 2>/dev/null)
-        
-        if [ -n "$underlying_tables" ]; then
-            log "    Underlying tables: $underlying_tables"
-        fi
-    fi
-    
-    # Migrate data using INSERT ... SELECT
-    log "    Starting data transfer..."
-    
+
+    log "    Source rows: $row_count"
+
     local start_time
     start_time=$(date +%s)
-    
-    local query="INSERT INTO $db.\`$table\` SELECT * FROM remote('$OLD_CLUSTER_HOST:$OLD_CLUSTER_PORT', $db, \`$table\`, '$OLD_CLICKHOUSE_USER', '$OLD_CLICKHOUSE_PASSWORD')"
-    
+
+    local query="INSERT INTO \`$db\`.\`$table\` SELECT * FROM remote('${OLD_CLUSTER_HOST}:${OLD_CLUSTER_PORT}', \`$db\`, \`$table\`, '$OLD_CLICKHOUSE_USER', '$OLD_CLICKHOUSE_PASSWORD')"
+
     if clickhouse_query_new "$query" >/dev/null 2>&1; then
-        local end_time
-        end_time=$(date +%s)
-        local duration=$((end_time - start_time))
-        
-        # Verify row count in target
+        local duration=$(( $(date +%s) - start_time ))
+
+        # For ReplicatedMergeTree tables, wait for replication before verifying.
+        local engine
+        engine=$(clickhouse_query_new \
+            "SELECT engine FROM system.tables WHERE database = '$db' AND name = '$table'" \
+            | tr -d '[:space:]')
+
+        if echo "$engine" | grep -qi "Replicated"; then
+            log "    Waiting for replica sync on $db.$table ..."
+            clickhouse_query_new "SYSTEM SYNC REPLICA \`$db\`.\`$table\`" >/dev/null 2>&1 || true
+        fi
+
         local new_row_count
-        new_row_count=$(clickhouse_query_new "SELECT count() FROM $db.\`$table\`" | tr -d '\n')
-        
+        new_row_count=$(clickhouse_query_new "SELECT count() FROM \`$db\`.\`$table\`" | tr -d '[:space:]')
+
         if [ "$row_count" -eq "$new_row_count" ]; then
-            success "    Successfully migrated $row_count rows in ${duration}s"
+            success "    Migrated $row_count rows in ${duration}s"
             return 0
         elif [ "$new_row_count" -gt "$row_count" ]; then
-            warning "    Target has more rows than source! Source: $row_count, Target: $new_row_count (possible duplication)"
-            return 1
-        elif [ "$new_row_count" -lt "$row_count" ]; then
-            warning "    Target has fewer rows than source! Source: $row_count, Target: $new_row_count (possible data loss)"
+            warning "    Row count mismatch – target has MORE rows than source (source: $row_count, target: $new_row_count). Possible duplication."
             return 1
         else
-            warning "    Row count mismatch! Source: $row_count, Target: $new_row_count"
+            warning "    Row count mismatch – target has FEWER rows than source (source: $row_count, target: $new_row_count). Possible data loss."
             return 1
         fi
     else
-        local error_msg
-        error_msg=$(clickhouse_query_new "$query" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
-        
-        if [ -z "$error_msg" ]; then
-            error_msg="Unknown error (check $LOG_FILE for details)"
-        fi
-        
-        warning "    Failed to migrate data for table '$db.$table': $error_msg"
+        local err
+        err=$(clickhouse_query_new "$query" 2>&1 | grep -o "Code: [0-9]\+.*" | head -1)
+        warning "    Failed to migrate '$db.$table': ${err:-unknown error}"
         return 1
     fi
 }
 
-# 4. Verify migration
+# -------- Verification --------
+
+# Step 4: Verify schema and data on the new cluster, including
+# checking that engine conversions were applied correctly.
 verify_migration() {
     log "=== Step 4: Verifying migration ==="
-    
-    # Verify database counts
-    local old_db_count
-    local new_db_count
+
+    # Database counts
+    local old_db_count new_db_count
     old_db_count=$(clickhouse_query_old \
-        "SELECT count() FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)")
+        "SELECT count() FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)" | tr -d '[:space:]')
     new_db_count=$(clickhouse_query_new \
-        "SELECT count() FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)")
-    
-    log "Databases in old cluster: $old_db_count"
-    log "Databases in new cluster: $new_db_count"
-    
-    if [ "$old_db_count" -eq "$new_db_count" ]; then
-        success "Database counts match"
-    else
-        warning "Database counts don't match!"
-    fi
-    
-    # Verify table counts per database (excluding distributed tables)
-    log "Verifying table counts (excluding distributed tables)..."
-    
+        "SELECT count() FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)" | tr -d '[:space:]')
+
+    log "Databases – old: $old_db_count, new: $new_db_count"
+    [ "$old_db_count" -eq "$new_db_count" ] \
+        && success "Database counts match" \
+        || warning "Database counts differ!"
+
+    # Table counts and engine transformation check per database
     local databases
     databases=$(clickhouse_query_old \
         "SELECT name FROM system.databases WHERE name NOT IN ($EXCLUDED_DATABASES)")
-    
+
+    log "Verifying per-database table counts and engine transformations..."
     for db in $databases; do
-        local old_table_count
-        local new_table_count
+        local old_table_count new_table_count
         old_table_count=$(clickhouse_query_old \
-            "SELECT count() FROM system.tables WHERE database = '$db' AND engine NOT ILIKE '%view%' \
-                AND engine NOT ILIKE 'dictionary' AND engine NOT ILIKE '%postgres%' \
-                AND engine NOT ILIKE 'Distributed%'")
+            "SELECT count() FROM system.tables WHERE database = '$db'
+             AND engine NOT ILIKE '%view%' AND engine NOT ILIKE 'dictionary'
+             AND engine NOT ILIKE '%postgres%' AND engine NOT ILIKE 'Distributed%'" \
+            | tr -d '[:space:]')
         new_table_count=$(clickhouse_query_new \
-            "SELECT count() FROM system.tables WHERE database = '$db' AND engine NOT ILIKE '%view%' \
-                AND engine NOT ILIKE 'dictionary' AND engine NOT ILIKE '%postgres%' \
-                AND engine NOT ILIKE 'Distributed%'")
-        
+            "SELECT count() FROM system.tables WHERE database = '$db'
+             AND engine NOT ILIKE '%view%' AND engine NOT ILIKE 'dictionary'
+             AND engine NOT ILIKE '%postgres%' AND engine NOT ILIKE 'Distributed%'" \
+            | tr -d '[:space:]')
+
         if [ "$old_table_count" -eq "$new_table_count" ]; then
-            log "  Database $db: tables match ($old_table_count)"
+            log "  $db: table count OK ($old_table_count)"
         else
-            warning "  Database $db: tables don't match! Old: $old_table_count, New: $new_table_count"
+            warning "  $db: table count mismatch! old=$old_table_count new=$new_table_count"
         fi
     done
-    
-    # Sample data verification (excluding distributed tables)
-    log "Performing sample data verification (excluding distributed tables)..."
-    
-    # Check a few random tables
+
+    # Engine transformation verification
+    verify_engine_transformations
+
+    # Replica health check
+    verify_replica_health
+
+    # Sample data verification
+    log "Sample row-count verification..."
     local sample_tables
     sample_tables=$(clickhouse_query_old \
-        "SELECT concat(database, '.', name) FROM system.tables WHERE database NOT IN ($EXCLUDED_DATABASES) \
-            AND engine NOT ILIKE '%view%' AND engine NOT ILIKE 'dictionary' AND engine NOT ILIKE '%postgres%' \
-            AND engine NOT ILIKE 'Distributed%' ORDER BY rand() LIMIT 3")
-    
+        "SELECT concat(database, '.', name) FROM system.tables
+         WHERE database NOT IN ($EXCLUDED_DATABASES)
+           AND engine NOT ILIKE '%view%' AND engine NOT ILIKE 'dictionary'
+           AND engine NOT ILIKE '%postgres%' AND engine NOT ILIKE 'Distributed%'
+         ORDER BY rand() LIMIT 5")
+
     for table in $sample_tables; do
-        log "  Verifying table: $table"
-        local old_count
-        local new_count
-        old_count=$(clickhouse_query_old "SELECT count() FROM $table" | tr -d '\n')
-        new_count=$(clickhouse_query_new "SELECT count() FROM $table" | tr -d '\n')
-        
+        local old_count new_count
+        old_count=$(clickhouse_query_old "SELECT count() FROM $table" | tr -d '[:space:]')
+        new_count=$(clickhouse_query_new "SELECT count() FROM $table" | tr -d '[:space:]')
         if [ "$old_count" -eq "$new_count" ]; then
-            success "    Data in $table matches: $old_count rows"
+            success "  $table: $old_count rows – OK"
         else
-            warning "    Data in $table doesn't match! Old: $old_count, New: $new_count"
+            warning "  $table: row count mismatch (old=$old_count, new=$new_count)"
         fi
     done
-    
+
     success "Verification completed"
 }
 
-# Main function
-main() {
-    log "Starting ClickHouse cluster migration"
-    log "Old cluster: $OLD_CLUSTER_HOST:$OLD_CLUSTER_PORT"
-    log "New cluster: $NEW_CLUSTER_HOST:$NEW_CLUSTER_PORT"
-    log "Target cluster name: $CLUSTER_NAME"
-    
-    # Check dependencies
-    if ! command -v clickhouse &> /dev/null; then
-        error "clickhouse client not found. Please install ClickHouse client."
+# Confirm that every MergeTree-family table on the old cluster
+# has a Replicated* counterpart on the new cluster.
+verify_engine_transformations() {
+    log "Verifying engine transformations..."
+
+    local old_tables
+    old_tables=$(clickhouse_query_old \
+        "SELECT database, name, engine FROM system.tables
+         WHERE database NOT IN ($EXCLUDED_DATABASES)
+           AND engine NOT ILIKE '%view%'
+           AND engine NOT ILIKE 'dictionary'
+           AND engine NOT ILIKE 'Distributed'")
+
+    local ok=0 fail=0
+
+    while IFS=$'\t' read -r db table old_engine; do
+        [ -z "$db" ] && continue
+
+        local new_engine
+        new_engine=$(clickhouse_query_new \
+            "SELECT engine FROM system.tables WHERE database = '$db' AND name = '$table'" \
+            | tr -d '[:space:]')
+
+        if [ -z "$new_engine" ]; then
+            warning "  $db.$table: NOT FOUND in new cluster"
+            fail=$((fail + 1))
+            continue
+        fi
+
+        # Tables that were MergeTree-family on the old cluster must be
+        # Replicated* on the new cluster.
+        if echo "$old_engine" | grep -qi "MergeTree" && \
+           ! echo "$old_engine" | grep -qi "Replicated"; then
+            if echo "$new_engine" | grep -qi "ReplicatedMergeTree\|ReplicatedSummingMergeTree\|ReplicatedAggregatingMergeTree\|ReplicatedCollapsingMergeTree\|ReplicatedReplacingMergeTree\|ReplicatedVersionedCollapsingMergeTree\|ReplicatedGraphiteMergeTree"; then
+                log "  ✓ $db.$table: $old_engine -> $new_engine"
+                ok=$((ok + 1))
+            else
+                warning "  ✗ $db.$table: expected Replicated*MergeTree, got '$new_engine'"
+                fail=$((fail + 1))
+            fi
+        elif echo "$old_engine" | grep -qi "Replicated"; then
+            if echo "$new_engine" | grep -qi "Replicated"; then
+                log "  ✓ $db.$table: Replicated (ZK path updated)"
+                ok=$((ok + 1))
+            else
+                warning "  ✗ $db.$table: was Replicated on old cluster but got '$new_engine' on new"
+                fail=$((fail + 1))
+            fi
+        else
+            log "  – $db.$table: non-MergeTree engine '$old_engine' – no conversion required"
+        fi
+    done <<< "$old_tables"
+
+    log "Engine transformation results: $ok OK, $fail failed"
+    [ $fail -eq 0 ] && success "All engine transformations verified" \
+                     || warning "$fail table(s) have incorrect engine after migration"
+}
+
+# Check system.replicas on the new cluster for any tables that are
+# not fully replicated or have inactive replicas.
+verify_replica_health() {
+    log "Checking replica health on new cluster..."
+
+    local unhealthy
+    unhealthy=$(clickhouse_query_new \
+        "SELECT database, table, replica_name, is_session_expired, future_parts
+         FROM system.replicas
+         WHERE is_readonly = 1 OR is_session_expired = 1" 2>/dev/null)
+
+    if [ -z "$unhealthy" ]; then
+        success "All replicas are healthy"
+    else
+        warning "Some replicas appear unhealthy:"
+        echo "$unhealthy" | while IFS=$'\t' read -r db tbl replica expired future; do
+            warning "  $db.$tbl replica '$replica' – session_expired=$expired, future_parts=$future"
+        done
     fi
-    
+}
+
+# -------- Entry point --------
+
+main() {
+    log "Starting ClickHouse cross-cluster migration"
+    log "  Old cluster : $OLD_CLUSTER_HOST:$OLD_CLUSTER_PORT"
+    log "  New cluster : $NEW_CLUSTER_HOST:$NEW_CLUSTER_PORT"
+    log "  Cluster name: $CLUSTER_NAME"
+    log "  ZK prefix   : $ZK_PATH_PREFIX"
+
+    if ! command -v clickhouse &>/dev/null; then
+        error "clickhouse client not found. Please install the ClickHouse client."
+    fi
+
+    if ! command -v python3 &>/dev/null; then
+        error "python3 not found. It is required for engine parameter parsing."
+    fi
+
     check_connections
+    check_replication_macros
     create_backup_dir
-    
-    # Execute migration steps
+
     export_ddl
     apply_ddl
     migrate_data
     verify_migration
-    
+
     success "Migration successfully completed!"
-    log "Logs saved to: $LOG_FILE"
-    log "DDL backups saved to: $BACKUP_DIR"
+    log "Logs    : $LOG_FILE"
+    log "DDL backup: $BACKUP_DIR"
 }
 
 main
