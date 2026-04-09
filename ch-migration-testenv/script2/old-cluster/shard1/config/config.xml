@@ -1,0 +1,69 @@
+<clickhouse>
+    <!-- old-shard1  –  OLD cluster, shard 1, TLS only, plain MergeTree -->
+
+    <logger><level>information</level><console>true</console></logger>
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- Expose only the TLS native port; plain 9000 kept for healthcheck -->
+    <tcp_port_secure>9440</tcp_port_secure>
+    <tcp_port>9000</tcp_port>
+
+    <openSSL>
+        <server>
+            <certificateFile>/etc/clickhouse-server/tls/old-shard1.crt</certificateFile>
+            <privateKeyFile>/etc/clickhouse-server/tls/old-shard1.key</privateKeyFile>
+            <dhParamsFile>/etc/clickhouse-server/tls/dhparam.pem</dhParamsFile>
+            <caConfig>/etc/clickhouse-server/tls/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+            <cacheSessions>true</cacheSessions>
+        </server>
+        <client>
+            <!-- Used for inter-shard remote() calls -->
+            <caConfig>/etc/clickhouse-server/tls/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+        </client>
+    </openSSL>
+
+    <users>
+        <default>
+            <password></password>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+        </default>
+    </users>
+
+    <!-- No ZooKeeper on old cluster -->
+
+    <remote_servers>
+        <!-- Old cluster: 2 shards, no replicas -->
+        <main>
+            <shard>
+                <weight>1</weight>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>old-shard1</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+            </shard>
+            <shard>
+                <weight>1</weight>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>old-shard2</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+            </shard>
+        </main>
+    </remote_servers>
+
+    <macros>
+        <cluster>main</cluster>
+        <shard>01</shard>
+        <replica>old-shard1</replica>
+    </macros>
+</clickhouse>

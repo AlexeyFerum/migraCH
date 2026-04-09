@@ -1,0 +1,203 @@
+---
+# ============================================================
+# Test environment for clickhouse_migration.sh
+#
+# Topology
+# --------
+# OLD cluster  – 2 shards, no replicas, plain MergeTree, TLS
+#   old-shard1  : 9440  (native/TLS)
+#   old-shard2  : 9441  (native/TLS)
+#
+# NEW cluster  – 2 shards × 2 replicas, ReplicatedMergeTree, TLS
+#   new-s1-r1   : 9442  (native/TLS)
+#   new-s1-r2   : 9443  (native/TLS)
+#   new-s2-r1   : 9444  (native/TLS)
+#   new-s2-r2   : 9445  (native/TLS)
+#
+# ZooKeeper    – single node
+# Runner       – generates certs (if needed), seeds data, runs migration
+# ============================================================
+
+networks:
+  ch-net2:
+    driver: bridge
+
+services:
+
+  # ── ZooKeeper ─────────────────────────────────────────────────────────────
+  zookeeper2:
+    image: zookeeper:3.8
+    container_name: s2-zookeeper
+    networks: [ch-net2]
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: server.1=zookeeper2:2888:3888;2181
+    healthcheck:
+      test: ["CMD", "zkServer.sh", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── OLD cluster ───────────────────────────────────────────────────────────
+  old-shard1:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s2-old-shard1
+    networks: [ch-net2]
+    ports:
+      - "9440:9440"   # native TLS
+      - "8443:8443"   # HTTPS
+    volumes:
+      - ./old-cluster/shard1/config/:/etc/clickhouse-server/config.d/:ro
+      - ./tls/:/etc/clickhouse-server/tls/:ro
+      - s2-old-shard1-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--port=9440", "--secure", "--no-verify",
+             "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  old-shard2:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s2-old-shard2
+    networks: [ch-net2]
+    ports:
+      - "9441:9440"
+      - "8444:8443"
+    volumes:
+      - ./old-cluster/shard2/config/:/etc/clickhouse-server/config.d/:ro
+      - ./tls/:/etc/clickhouse-server/tls/:ro
+      - s2-old-shard2-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--port=9440", "--secure", "--no-verify",
+             "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── NEW cluster ───────────────────────────────────────────────────────────
+  new-s1-r1:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s2-new-s1-r1
+    networks: [ch-net2]
+    ports:
+      - "9442:9440"
+      - "8445:8443"
+    volumes:
+      - ./new-cluster/shard1-replica1/config/:/etc/clickhouse-server/config.d/:ro
+      - ./tls/:/etc/clickhouse-server/tls/:ro
+      - s2-new-s1-r1-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper2: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--port=9440", "--secure", "--no-verify",
+             "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  new-s1-r2:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s2-new-s1-r2
+    networks: [ch-net2]
+    ports:
+      - "9443:9440"
+      - "8446:8443"
+    volumes:
+      - ./new-cluster/shard1-replica2/config/:/etc/clickhouse-server/config.d/:ro
+      - ./tls/:/etc/clickhouse-server/tls/:ro
+      - s2-new-s1-r2-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper2: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--port=9440", "--secure", "--no-verify",
+             "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  new-s2-r1:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s2-new-s2-r1
+    networks: [ch-net2]
+    ports:
+      - "9444:9440"
+      - "8447:8443"
+    volumes:
+      - ./new-cluster/shard2-replica1/config/:/etc/clickhouse-server/config.d/:ro
+      - ./tls/:/etc/clickhouse-server/tls/:ro
+      - s2-new-s2-r1-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper2: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--port=9440", "--secure", "--no-verify",
+             "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  new-s2-r2:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s2-new-s2-r2
+    networks: [ch-net2]
+    ports:
+      - "9445:9440"
+      - "8448:8443"
+    volumes:
+      - ./new-cluster/shard2-replica2/config/:/etc/clickhouse-server/config.d/:ro
+      - ./tls/:/etc/clickhouse-server/tls/:ro
+      - s2-new-s2-r2-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper2: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--port=9440", "--secure", "--no-verify",
+             "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── Runner ────────────────────────────────────────────────────────────────
+  runner2:
+    build:
+      context: ./runner
+      dockerfile: Dockerfile
+    container_name: s2-runner
+    networks: [ch-net2]
+    depends_on:
+      old-shard1: { condition: service_healthy }
+      old-shard2: { condition: service_healthy }
+      new-s1-r1:  { condition: service_healthy }
+      new-s1-r2:  { condition: service_healthy }
+      new-s2-r1:  { condition: service_healthy }
+      new-s2-r2:  { condition: service_healthy }
+    volumes:
+      - ./tls/:/tls/:ro
+      - s2-migration-backup:/var/lib/clickhouse/migration_backup
+      - s2-migration-logs:/var/log
+    environment:
+      OLD_SHARD1_HOST: old-shard1
+      OLD_SHARD2_HOST: old-shard2
+      NEW_S1R1_HOST:   new-s1-r1
+    command: ["/scripts/entrypoint.sh"]
+
+volumes:
+  s2-old-shard1-data:
+  s2-old-shard2-data:
+  s2-new-s1-r1-data:
+  s2-new-s1-r2-data:
+  s2-new-s2-r1-data:
+  s2-new-s2-r2-data:
+  s2-migration-backup:
+  s2-migration-logs:

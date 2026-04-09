@@ -1,0 +1,42 @@
+<clickhouse>
+    <!-- new-s1-r1  –  NEW cluster, shard 1 replica 1 -->
+
+    <logger><level>information</level><console>true</console></logger>
+    <listen_host>0.0.0.0</listen_host>
+
+    <users>
+        <default>
+            <password></password>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+        </default>
+    </users>
+
+    <zookeeper>
+        <node><host>zookeeper</host><port>2181</port></node>
+    </zookeeper>
+
+    <remote_servers>
+        <epm_cluster>
+            <shard>
+                <weight>1</weight>
+                <internal_replication>true</internal_replication>
+                <replica><host>new-s1-r1</host><port>9000</port></replica>
+                <replica><host>new-s1-r2</host><port>9000</port></replica>
+            </shard>
+            <shard>
+                <weight>1</weight>
+                <internal_replication>true</internal_replication>
+                <replica><host>new-s2-r1</host><port>9000</port></replica>
+                <replica><host>new-s2-r2</host><port>9000</port></replica>
+            </shard>
+        </epm_cluster>
+    </remote_servers>
+
+    <macros>
+        <cluster>epm_cluster</cluster>
+        <shard>01</shard>
+        <replica>new-s1-r1</replica>
+    </macros>
+</clickhouse>

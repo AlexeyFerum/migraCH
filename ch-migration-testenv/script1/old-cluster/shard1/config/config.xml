@@ -1,0 +1,57 @@
+<clickhouse>
+    <!-- ============================================================
+         old-shard1  –  OLD cluster, shard 1
+         Plain MergeTree engines, no replicas, no ZooKeeper.
+         ============================================================ -->
+
+    <logger>
+        <level>information</level>
+        <console>true</console>
+    </logger>
+
+    <!-- Allow connections from the runner container -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- No authentication for the test environment -->
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+        </default>
+    </users>
+
+    <!-- Cluster definition visible to both shards so Distributed tables work -->
+    <remote_servers>
+        <epm_cluster>
+            <!-- Shard 1: single node, weight 1 -->
+            <shard>
+                <weight>1</weight>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>old-shard1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <!-- Shard 2: single node, weight 1 -->
+            <shard>
+                <weight>1</weight>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>old-shard2</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </epm_cluster>
+    </remote_servers>
+
+    <!-- Macros for this node -->
+    <macros>
+        <cluster>epm_cluster</cluster>
+        <shard>01</shard>
+        <replica>old-shard1</replica>
+    </macros>
+</clickhouse>

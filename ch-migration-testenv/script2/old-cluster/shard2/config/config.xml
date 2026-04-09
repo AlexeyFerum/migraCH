@@ -1,0 +1,64 @@
+<clickhouse>
+    <!-- old-shard2  –  OLD cluster, shard 2, TLS only, plain MergeTree -->
+
+    <logger><level>information</level><console>true</console></logger>
+    <listen_host>0.0.0.0</listen_host>
+
+    <tcp_port_secure>9440</tcp_port_secure>
+    <tcp_port>9000</tcp_port>
+
+    <openSSL>
+        <server>
+            <certificateFile>/etc/clickhouse-server/tls/old-shard2.crt</certificateFile>
+            <privateKeyFile>/etc/clickhouse-server/tls/old-shard2.key</privateKeyFile>
+            <dhParamsFile>/etc/clickhouse-server/tls/dhparam.pem</dhParamsFile>
+            <caConfig>/etc/clickhouse-server/tls/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+            <cacheSessions>true</cacheSessions>
+        </server>
+        <client>
+            <caConfig>/etc/clickhouse-server/tls/ca.crt</caConfig>
+            <verificationMode>none</verificationMode>
+            <loadDefaultCAFile>false</loadDefaultCAFile>
+        </client>
+    </openSSL>
+
+    <users>
+        <default>
+            <password></password>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+        </default>
+    </users>
+
+    <remote_servers>
+        <main>
+            <shard>
+                <weight>1</weight>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>old-shard1</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+            </shard>
+            <shard>
+                <weight>1</weight>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>old-shard2</host>
+                    <port>9440</port>
+                    <secure>1</secure>
+                </replica>
+            </shard>
+        </main>
+    </remote_servers>
+
+    <macros>
+        <cluster>main</cluster>
+        <shard>02</shard>
+        <replica>old-shard2</replica>
+    </macros>
+</clickhouse>

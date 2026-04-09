@@ -1,0 +1,195 @@
+---
+# ============================================================
+# Test environment for ch_migration_asis.sh
+#
+# Topology
+# --------
+# OLD cluster  – 2 shards, no replicas, plain MergeTree engines
+#   old-shard1  : localhost:19000  (native)
+#   old-shard2  : localhost:19001  (native)
+#
+# NEW cluster  – 2 shards × 2 replicas, ReplicatedMergeTree engines
+#   new-s1-r1   : localhost:29000  (native)
+#   new-s1-r2   : localhost:29001
+#   new-s2-r1   : localhost:29002
+#   new-s2-r2   : localhost:29003
+#
+# ZooKeeper    – single node, shared by the new cluster
+#
+# Runner       – contains the migration script + seed data loader
+# ============================================================
+
+networks:
+  ch-net:
+    driver: bridge
+
+services:
+
+  # ── ZooKeeper (required only by new cluster) ──────────────────────────────
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: s1-zookeeper
+    networks: [ch-net]
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: server.1=zookeeper:2888:3888;2181
+    healthcheck:
+      test: ["CMD", "zkServer.sh", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── OLD cluster: shard 1 ─────────────────────────────────────────────────
+  old-shard1:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s1-old-shard1
+    networks: [ch-net]
+    ports:
+      - "19000:9000"   # native protocol
+      - "18123:8123"   # HTTP
+    volumes:
+      - ./old-cluster/shard1/config/:/etc/clickhouse-server/config.d/:ro
+      - s1-old-shard1-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── OLD cluster: shard 2 ─────────────────────────────────────────────────
+  old-shard2:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s1-old-shard2
+    networks: [ch-net]
+    ports:
+      - "19001:9000"
+      - "18124:8123"
+    volumes:
+      - ./old-cluster/shard2/config/:/etc/clickhouse-server/config.d/:ro
+      - s1-old-shard2-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── NEW cluster: shard 1 replica 1 ───────────────────────────────────────
+  new-s1-r1:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s1-new-s1-r1
+    networks: [ch-net]
+    ports:
+      - "29000:9000"
+      - "28123:8123"
+    volumes:
+      - ./new-cluster/shard1-replica1/config/:/etc/clickhouse-server/config.d/:ro
+      - s1-new-s1-r1-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── NEW cluster: shard 1 replica 2 ───────────────────────────────────────
+  new-s1-r2:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s1-new-s1-r2
+    networks: [ch-net]
+    ports:
+      - "29001:9000"
+      - "28124:8123"
+    volumes:
+      - ./new-cluster/shard1-replica2/config/:/etc/clickhouse-server/config.d/:ro
+      - s1-new-s1-r2-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── NEW cluster: shard 2 replica 1 ───────────────────────────────────────
+  new-s2-r1:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s1-new-s2-r1
+    networks: [ch-net]
+    ports:
+      - "29002:9000"
+      - "28125:8123"
+    volumes:
+      - ./new-cluster/shard2-replica1/config/:/etc/clickhouse-server/config.d/:ro
+      - s1-new-s2-r1-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── NEW cluster: shard 2 replica 2 ───────────────────────────────────────
+  new-s2-r2:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: s1-new-s2-r2
+    networks: [ch-net]
+    ports:
+      - "29003:9000"
+      - "28126:8123"
+    volumes:
+      - ./new-cluster/shard2-replica2/config/:/etc/clickhouse-server/config.d/:ro
+      - s1-new-s2-r2-data:/var/lib/clickhouse
+    depends_on:
+      zookeeper: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── Runner: seed data + run migration ────────────────────────────────────
+  runner:
+    build:
+      context: ./runner
+      dockerfile: Dockerfile
+    container_name: s1-runner
+    networks: [ch-net]
+    depends_on:
+      old-shard1: { condition: service_healthy }
+      old-shard2: { condition: service_healthy }
+      new-s1-r1:  { condition: service_healthy }
+      new-s1-r2:  { condition: service_healthy }
+      new-s2-r1:  { condition: service_healthy }
+      new-s2-r2:  { condition: service_healthy }
+    volumes:
+      - migration-backup:/var/lib/clickhouse/migration_backup
+      - migration-logs:/var/log
+    environment:
+      OLD_SHARD1_HOST: old-shard1
+      OLD_SHARD2_HOST: old-shard2
+      NEW_S1R1_HOST:   new-s1-r1
+    command: ["/scripts/entrypoint.sh"]
+
+volumes:
+  s1-old-shard1-data:
+  s1-old-shard2-data:
+  s1-new-s1-r1-data:
+  s1-new-s1-r2-data:
+  s1-new-s2-r1-data:
+  s1-new-s2-r2-data:
+  migration-backup:
+  migration-logs:
