@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# ClickHouse Cross-Cluster Migration Script (v7 - Stable & Fail-Fast)
+# ClickHouse Cross-Cluster Migration Script (v8 - Bulletproof File Safety)
 # =============================================================================
-set -o pipefail  # Ошибка в конвейере (например, clickhouse-client) остановит скрипт
+set -o pipefail  # Ошибка в конвейере не будет скрыта
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 OLD_CLUSTER_HOST="localhost"
@@ -31,9 +31,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Логирование (строгое разделение) ──────────────────────────────────────────
+# ── Логирование ───────────────────────────────────────────────────────────────
 mkdir -p "$(dirname "$LOG_FILE")"
-: > "$LOG_FILE"  # Гарантированный сброс файла
+: > "$LOG_FILE"
 
 log_file()  { echo "$(date '+%Y-%m-%d %H:%M:%S.%3N') - $1" >> "$LOG_FILE"; }
 log_step()  { echo "$(date '+%Y-%m-%d %H:%M:%S.%3N') - $1" | tee -a "$LOG_FILE"; }
@@ -41,15 +41,13 @@ log_success(){ echo -e "\033[0;32m$(date '+%Y-%m-%d %H:%M:%S.%3N') - $1\033[0m" 
 log_warning(){ echo -e "\033[1;33m$(date '+%Y-%m-%d %H:%M:%S.%3N') - WARNING: $1\033[0m" | tee -a "$LOG_FILE"; }
 log_error()  { echo -e "\033[0;31m$(date '+%Y-%m-%d %H:%M:%S.%3N') - ERROR: $1\033[0m" | tee -a "$LOG_FILE"; exit 1; }
 
-# ── ClickHouse-запросы (через stdin, безопасное экранирование) ────────────────
+# ── ClickHouse-запросы (stdin, безопасное экранирование) ─────────────────────
 ch_query() {
   local host="$1" port="$2" query="$3"
-  # Очистка: убираем \r, сжимаем пробелы/переносы, обрезаем концы
   local clean_query
   clean_query=$(printf '%s' "$query" | tr -d '\r' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
   
   log_file "CH_EXEC [${host}:${port}] -> ${clean_query:0:150}$( [ ${#clean_query} -gt 150 ] && echo '...')"
-  # Передача через pipe исключает проблемы с --query и экранированием
   printf '%s\n' "$clean_query" | clickhouse-client \
     --host="$host" --port="$port" \
     --user="$CLICKHOUSE_USER" --password="$CLICKHOUSE_PASSWORD" \
@@ -63,9 +61,8 @@ ch_new() {
     log_file "[DRY-RUN] Пропускаем запрос на новом кластере"
     return 0
   fi
-  # FAIL-FAST: если создание сущности падает → сразу выходим
   if ! ch_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT" "$1"; then
-    log_error "Критическая ошибка на новом кластере. Скрипт остановлен для предотвращения несогласованности."
+    log_error "Критическая ошибка на новом кластере. Скрипт остановлен."
   fi
 }
 
@@ -138,19 +135,34 @@ export_ddl() {
   log_success "Экспорт DDL завершён"
 }
 
-# ── Утилиты DDL (in-place редактирование, безопасно) ──────────────────────────
+# ── Утилиты DDL (АТОМАРНЫЕ, С БЭККАПОМ, БЕЗ content=$(cat)) ──────────────────
+safe_modify() {
+  local file="$1" modifier_name="$2"
+  local bak="${file}.safe_bak"
+  
+  [ -f "$file" ] || log_error "Файл не найден: $file"
+  [ -s "$file" ] || log_error "Файл пустой перед $modifier_name: $file"
+  
+  cp -f "$file" "$bak"
+  shift 2
+  "$@"
+  
+  if [ ! -s "$file" ]; then
+    log_error "ФАТАЛЬНО: $file стал пустым после $modifier_name! Восстановлен из бэкапа."
+    mv -f "$bak" "$file"
+  else
+    rm -f "$bak"
+  fi
+}
+
 convert_engine() {
   local file="$1"
-  [ -f "$file" ] || return 1
-  [ -s "$file" ] || log_error "DDL файл пустой перед конвертацией: $file"
-
   if grep -qiP "ENGINE\s*=\s*ReplicatedMergeTree" "$file"; then
     log_file "    ReplicatedMergeTree → '/clickhouse/{database}/{table}/'"
-    # # вместо | предотвращает конфликт с (?:TABLE|VIEW|...)
-    perl -i -pe "s#ENGINE\s*=\s*ReplicatedMergeTree\s*\(\s*'[^']*'\s*,\s*'[^']*'#ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')#i" "$file"
+    safe_modify "$file" "convert_engine" perl -i -pe 's#(ENGINE\s*=\s*ReplicatedMergeTree\s*\(\s*)\x27[^\x27]*\x27\s*,\s*\x27[^\x27]*\x27#$1\x27/clickhouse/{database}/{table}/\x27, \x27{replica}\x27#i' "$file"
   elif grep -qiP "ENGINE\s*=\s*MergeTree" "$file"; then
     log_file "    MergeTree → '/clickhouse/{database}/{table}/{shard}/'"
-    perl -i -pe "s#ENGINE\s*=\s*MergeTree\s*\([^)]*\)#ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')#i" "$file"
+    safe_modify "$file" "convert_engine" perl -i -pe 's#ENGINE\s*=\s*MergeTree\s*\([^)]*\)#ENGINE = ReplicatedMergeTree(\x27/clickhouse/{database}/{table}/{shard}/\x27, \x27{replica}\x27)#i' "$file"
   else
     log_file "    Движок не требует конвертации"
   fi
@@ -158,13 +170,11 @@ convert_engine() {
 
 add_on_cluster() {
   local file="$1"
-  [ -f "$file" ] || return 1
-  [ -s "$file" ] || log_error "DDL файл пустой перед ON CLUSTER: $file"
+  [ -f "$file" ] || return 0
   grep -qi "ON CLUSTER" "$file" && return 0
-  
   log_file "    Добавление ON CLUSTER $CLUSTER_NAME"
-  # Меняем только первую строку CREATE. $1 экранирован как \$1
-  perl -i -pe "s#^(CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?(?:TABLE|VIEW|DATABASE|DICTIONARY)\s+\S+)\$#\$1 ON CLUSTER $CLUSTER_NAME#i; last" "$file"
+  # \$1 экранирован, чтобы Bash не подставил его. $CLUSTER_NAME подставляется корректно.
+  safe_modify "$file" "add_on_cluster" perl -i -pe "s#^(CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?(?:TABLE|VIEW|DATABASE|DICTIONARY)\s+\S+)#\$1 ON CLUSTER $CLUSTER_NAME#i; last" "$file"
 }
 
 # ── Шаг 2: Применение DDL ─────────────────────────────────────────────────────
