@@ -14,16 +14,13 @@
 #   ReplicatedMergeTree(...) → ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')
 #   Все остальные движки     — без изменений
 #
-# Перенос данных:
-#   Distributed         → INSERT INTO <new_dist>   SELECT * FROM remote(<old_node>, <old_dist>)
-#   ReplicatedMergeTree → INSERT INTO <local_table> SELECT * FROM remote(<old_node>, <old_table>)
-#   Всё остальное       — данные не переносятся
-#
-# Порядок:
+# Порядок выполнения:
 #   1. Экспорт DDL со старого кластера
-#   2. Применение DDL на новом: базы → таблицы → вью → словари
-#   3. Перенос данных
-#   4. Верификация
+#   2. Применение DDL на новом кластере:
+#        базы → локальные таблицы → Distributed → словари → View
+#   3. Перенос данных (Distributed и ReplicatedMergeTree)
+#   4. Создание Materialized View (после данных, чтобы не было дублей)
+#   5. Верификация
 #
 # Запуск: bash ch_migration.sh
 # =============================================================================
@@ -33,8 +30,8 @@
 # Все ноды (шарды) старого кластера.
 # Скрипт запускается на одной из этих нод.
 # Для чтения данных используется первая нода в списке:
-#   - Distributed: она сама агрегирует данные со всех шардов
-#   - ReplicatedMergeTree: данные одинаковы на всех нодах
+#   - Distributed:          она сама агрегирует данные со всех шардов
+#   - ReplicatedMergeTree:  данные одинаковы на всех нодах
 OLD_CLUSTER_SHARDS=(
     "shard1.old-cluster.internal"
     "shard2.old-cluster.internal"
@@ -191,7 +188,13 @@ check_replication_macros() {
 # ── Директория бэкапа ─────────────────────────────────────────────────────────
 
 create_backup_dir() {
-    mkdir -p "$BACKUP_DIR/ddl"
+    mkdir -p \
+        "$BACKUP_DIR/ddl/databases" \
+        "$BACKUP_DIR/ddl/tables" \
+        "$BACKUP_DIR/ddl/distributed" \
+        "$BACKUP_DIR/ddl/dictionaries" \
+        "$BACKUP_DIR/ddl/views" \
+        "$BACKUP_DIR/ddl/matviews"
     log "Директория бэкапа: $BACKUP_DIR"
 }
 
@@ -212,38 +215,37 @@ export_ddl() {
 
     for db in $databases; do
         log "Экспорт базы: \`$db\`"
-        mkdir -p "$BACKUP_DIR/ddl/$db"
 
         # DDL базы данных
         ch_old "SHOW CREATE DATABASE \`$db\`" \
-            > "$BACKUP_DIR/ddl/$db/database.sql"
-        log "  Сохранён DDL базы: $BACKUP_DIR/ddl/$db/database.sql"
+            > "$BACKUP_DIR/ddl/databases/$db.sql"
+        log "  Сохранён DDL базы: databases/$db.sql"
 
-        # Таблицы (без вью и словарей)
+        # Локальные таблицы (не Distributed, не View, не Dictionary)
         local tables
         tables=$(ch_old \
             "SELECT name FROM system.tables
              WHERE database = '$db'
-               AND engine NOT LIKE '%View%'
-               AND engine != 'Dictionary'")
+               AND engine NOT IN ('Distributed', 'Dictionary')
+               AND engine NOT LIKE '%View%'")
 
         for table in $tables; do
             log "  Экспорт таблицы: \`$db\`.\`$table\`"
             ch_old "SHOW CREATE TABLE \`$db\`.\`$table\`" \
-                > "$BACKUP_DIR/ddl/$db/$table.sql"
+                > "$BACKUP_DIR/ddl/tables/${db}___${table}.sql"
         done
 
-        # Вью
-        local views
-        views=$(ch_old \
+        # Distributed таблицы
+        local dist_tables
+        dist_tables=$(ch_old \
             "SELECT name FROM system.tables
              WHERE database = '$db'
-               AND engine LIKE '%View%'")
+               AND engine = 'Distributed'")
 
-        for view in $views; do
-            log "  Экспорт вью: \`$db\`.\`$view\`"
-            ch_old "SHOW CREATE TABLE \`$db\`.\`$view\`" \
-                > "$BACKUP_DIR/ddl/$db/$view.view.sql"
+        for table in $dist_tables; do
+            log "  Экспорт Distributed: \`$db\`.\`$table\`"
+            ch_old "SHOW CREATE TABLE \`$db\`.\`$table\`" \
+                > "$BACKUP_DIR/ddl/distributed/${db}___${table}.sql"
         done
 
         # Словари
@@ -254,8 +256,35 @@ export_ddl() {
         for dict in $dicts; do
             log "  Экспорт словаря: \`$db\`.\`$dict\`"
             ch_old "SHOW CREATE DICTIONARY \`$db\`.\`$dict\`" \
-                > "$BACKUP_DIR/ddl/$db/$dict.dict.sql"
+                > "$BACKUP_DIR/ddl/dictionaries/${db}___${dict}.sql"
         done
+
+        # Обычные View (не Materialized)
+        local views
+        views=$(ch_old \
+            "SELECT name FROM system.tables
+             WHERE database = '$db'
+               AND engine = 'View'")
+
+        for view in $views; do
+            log "  Экспорт View: \`$db\`.\`$view\`"
+            ch_old "SHOW CREATE TABLE \`$db\`.\`$view\`" \
+                > "$BACKUP_DIR/ddl/views/${db}___${view}.sql"
+        done
+
+        # Materialized View — экспортируем последними, применять будем после данных
+        local matviews
+        matviews=$(ch_old \
+            "SELECT name FROM system.tables
+             WHERE database = '$db'
+               AND engine = 'MaterializedView'")
+
+        for mv in $matviews; do
+            log "  Экспорт MaterializedView: \`$db\`.\`$mv\`"
+            ch_old "SHOW CREATE TABLE \`$db\`.\`$mv\`" \
+                > "$BACKUP_DIR/ddl/matviews/${db}___${mv}.sql"
+        done
+
     done
 
     success "Экспорт DDL завершён"
@@ -263,19 +292,13 @@ export_ddl() {
 
 # ── Конвертация движков ───────────────────────────────────────────────────────
 #
-# Правила конвертации:
-#
-#   MergeTree(...)
-#     → ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')
-#
-#   ReplicatedMergeTree('/старый/путь', '{replica}')
-#     → ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')
-#
-#   Все остальные движки — без изменений.
+# Правила:
+#   MergeTree(...)           → ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')
+#   ReplicatedMergeTree(...) → ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')
+#   Всё остальное            — без изменений
 #
 # ВАЖНО: {database}, {table}, {shard}, {replica} — макросы ClickHouse.
-# Они намеренно передаются как литеральные строки в ZK-путь,
-# а не подставляются из bash-переменных.
+# Передаются как литеральные строки, bash их не подставляет.
 
 convert_engine() {
     local file="$1"
@@ -285,8 +308,7 @@ convert_engine() {
     local content
     content=$(cat "$file")
 
-    # ── Случай 1: ReplicatedMergeTree ─────────────────────────────────────────
-    # Заменяем первые два аргумента (ZK-путь и реплику) на новый путь без {shard}.
+    # Случай 1: ReplicatedMergeTree — обновляем ZK-путь, убираем {shard}
     if echo "$content" | grep -qiP "ENGINE\s*=\s*ReplicatedMergeTree"; then
         log "    ReplicatedMergeTree → '/clickhouse/{database}/{table}/'"
         content=$(echo "$content" | perl -pe \
@@ -295,8 +317,7 @@ convert_engine() {
         return 0
     fi
 
-    # ── Случай 2: MergeTree ───────────────────────────────────────────────────
-    # Заменяем ENGINE = MergeTree(...) целиком, добавляем {shard} в путь.
+    # Случай 2: MergeTree — конвертируем, добавляем {shard} в путь
     if echo "$content" | grep -qiP "ENGINE\s*=\s*MergeTree"; then
         log "    MergeTree → '/clickhouse/{database}/{table}/{shard}/'"
         content=$(echo "$content" | perl -pe \
@@ -305,7 +326,6 @@ convert_engine() {
         return 0
     fi
 
-    # Всё остальное — не трогаем
     log "    Движок не требует конвертации"
 }
 
@@ -325,11 +345,33 @@ add_on_cluster() {
     fi
 
     # Вставляем ON CLUSTER сразу после имени сущности в backtick-кавычках.
-    # Обрабатываем первую строку CREATE, дальше не трогаем.
+    # Обрабатываем только первую строку CREATE.
     content=$(echo "$content" | perl -pe \
         "s|(CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?(?:TABLE|VIEW|DATABASE|DICTIONARY)\s+\`[^\`]+\`)|\$1 ON CLUSTER ${CLUSTER_NAME}|i; last")
 
     echo "$content" > "$file"
+}
+
+# ── Применить DDL-файл на новом кластере ─────────────────────────────────────
+
+apply_file() {
+    local file="$1"
+    local label="$2"
+
+    if ch_new "$(cat "$file")" 2>>"$LOG_FILE"; then
+        log "  ✓ $label"
+    else
+        warning "  ✗ $label — не создано (см. лог)"
+    fi
+}
+
+# Извлечь имя базы и сущности из имени файла вида db___name.sql
+parse_filename() {
+    local fname="$1"       # db___name
+    local -n _db="$2"
+    local -n _name="$3"
+    _db="${fname%%___*}"
+    _name="${fname#*___}"
 }
 
 # ── Шаг 2: Применение DDL на новом кластере ──────────────────────────────────
@@ -338,91 +380,59 @@ apply_ddl() {
     log "=== Шаг 2: Применение DDL на новом кластере ==="
 
     # 2.1 Базы данных
-    log "-- 2.1 Создание баз данных"
-    for db_dir in "$BACKUP_DIR/ddl"/*/; do
-        [ -d "$db_dir" ] || continue
-        local db
-        db=$(basename "$db_dir")
-        local f="$db_dir/database.sql"
+    log "-- 2.1 Базы данных"
+    for f in "$BACKUP_DIR/ddl/databases/"*.sql; do
         [ -f "$f" ] || continue
-
+        local db
+        db=$(basename "$f" .sql)
         add_on_cluster "$f"
-
-        log "  CREATE DATABASE \`$db\`"
-        if ch_new "$(cat "$f")" 2>>"$LOG_FILE"; then
-            log "  ✓ База \`$db\` создана"
-        else
-            warning "  База \`$db\` не создана (возможно, уже существует)"
-        fi
+        apply_file "$f" "DATABASE \`$db\`"
     done
 
-    # 2.2 Таблицы (с конвертацией движков)
-    log "-- 2.2 Создание таблиц"
-    for db_dir in "$BACKUP_DIR/ddl"/*/; do
-        [ -d "$db_dir" ] || continue
-        local db
-        db=$(basename "$db_dir")
-
-        for f in "$db_dir"*.sql; do
-            [ -f "$f" ] || continue
-            local fname
-            fname=$(basename "$f")
-
-            # Пропускаем database.sql, вью и словари
-            [[ "$fname" == "database.sql" ]] && continue
-            [[ "$fname" == *.view.sql     ]] && continue
-            [[ "$fname" == *.dict.sql     ]] && continue
-
-            local table
-            table=$(basename "$f" .sql)
-
-            log "  Подготовка таблицы \`$db\`.\`$table\`"
-            convert_engine "$f"
-            add_on_cluster "$f"
-
-            log "  CREATE TABLE \`$db\`.\`$table\`"
-            if ch_new "$(cat "$f")" 2>>"$LOG_FILE"; then
-                log "  ✓ Таблица \`$db\`.\`$table\` создана"
-            else
-                warning "  Таблица \`$db\`.\`$table\` не создана"
-            fi
-        done
+    # 2.2 Локальные таблицы (MergeTree, ReplicatedMergeTree и прочие не-Distributed)
+    log "-- 2.2 Локальные таблицы"
+    for f in "$BACKUP_DIR/ddl/tables/"*.sql; do
+        [ -f "$f" ] || continue
+        local fname db tname
+        fname=$(basename "$f" .sql)
+        parse_filename "$fname" db tname
+        log "  Подготовка: \`$db\`.\`$tname\`"
+        convert_engine "$f"
+        add_on_cluster "$f"
+        apply_file "$f" "TABLE \`$db\`.\`$tname\`"
     done
 
-    # 2.3 Вью
-    log "-- 2.3 Создание вью"
-    for f in "$BACKUP_DIR/ddl"/*/*.view.sql; do
+    # 2.3 Distributed таблицы (локальные таблицы уже существуют)
+    log "-- 2.3 Distributed таблицы"
+    for f in "$BACKUP_DIR/ddl/distributed/"*.sql; do
         [ -f "$f" ] || continue
-        local db view
-        db=$(basename "$(dirname "$f")")
-        view=$(basename "$f" .view.sql)
-
+        local fname db tname
+        fname=$(basename "$f" .sql)
+        parse_filename "$fname" db tname
         add_on_cluster "$f"
-
-        log "  CREATE VIEW \`$db\`.\`$view\`"
-        if ch_new "$(cat "$f")" 2>>"$LOG_FILE"; then
-            log "  ✓ Вью \`$db\`.\`$view\` создано"
-        else
-            warning "  Вью \`$db\`.\`$view\` не создано"
-        fi
+        apply_file "$f" "DISTRIBUTED \`$db\`.\`$tname\`"
     done
 
     # 2.4 Словари
-    log "-- 2.4 Создание словарей"
-    for f in "$BACKUP_DIR/ddl"/*/*.dict.sql; do
+    log "-- 2.4 Словари"
+    for f in "$BACKUP_DIR/ddl/dictionaries/"*.sql; do
         [ -f "$f" ] || continue
-        local db dict
-        db=$(basename "$(dirname "$f")")
-        dict=$(basename "$f" .dict.sql)
-
+        local fname db dname
+        fname=$(basename "$f" .sql)
+        parse_filename "$fname" db dname
         add_on_cluster "$f"
+        apply_file "$f" "DICTIONARY \`$db\`.\`$dname\`"
+    done
 
-        log "  CREATE DICTIONARY \`$db\`.\`$dict\`"
-        if ch_new "$(cat "$f")" 2>>"$LOG_FILE"; then
-            log "  ✓ Словарь \`$db\`.\`$dict\` создан"
-        else
-            warning "  Словарь \`$db\`.\`$dict\` не создан"
-        fi
+    # 2.5 Обычные View
+    log "-- 2.5 View"
+    for f in "$BACKUP_DIR/ddl/views/"*.sql; do
+        [ -f "$f" ] || continue
+        local fname db vname
+        fname=$(basename "$f" .sql)
+        parse_filename "$fname" db vname
+        add_on_cluster "$f"
+        apply_file "$f" "VIEW \`$db\`.\`$vname\`"
     done
 
     success "Применение DDL завершено"
@@ -446,9 +456,8 @@ migrate_data() {
         log "База: \`$db\`"
 
         # ── Distributed → Distributed ─────────────────────────────────────────
-        # Distributed-таблица на старом кластере сама соберёт данные со всех
-        # шардов. Читаем с первой ноды, вставляем в одноимённую Distributed
-        # на новом кластере.
+        # Читаем с первой ноды — Distributed сама агрегирует данные со всех шардов.
+        # Вставляем в одноимённую Distributed на новом кластере.
         local dist_tables
         dist_tables=$(ch_old \
             "SELECT name FROM system.tables
@@ -475,14 +484,14 @@ migrate_data() {
             " 2>>"$LOG_FILE"; then
                 log "  ✓ Distributed \`$db\`.\`$table\` перенесена"
             else
-                warning "  Не удалось перенести Distributed \`$db\`.\`$table\`"
+                warning "  ✗ Distributed \`$db\`.\`$table\` — ошибка переноса"
             fi
         done
 
-        # ── ReplicatedMergeTree → ReplicatedMergeTree (локально) ─────────────
-        # На старом кластере данные одинаковы на всех нодах — читаем с первой.
-        # На новый кластер вставляем в локальную таблицу напрямую —
-        # репликация сама разойдётся по остальным нодам шарда.
+        # ── ReplicatedMergeTree → ReplicatedMergeTree ─────────────────────────
+        # Данные одинаковы на всех нодах старого кластера — читаем с первой.
+        # На новом кластере вставляем в локальную таблицу напрямую —
+        # репликация разойдётся по остальным нодам шарда автоматически.
         local repl_tables
         repl_tables=$(ch_old \
             "SELECT name FROM system.tables
@@ -509,7 +518,7 @@ migrate_data() {
             " 2>>"$LOG_FILE"; then
                 log "  ✓ ReplicatedMergeTree \`$db\`.\`$table\` перенесена"
             else
-                warning "  Не удалось перенести ReplicatedMergeTree \`$db\`.\`$table\`"
+                warning "  ✗ ReplicatedMergeTree \`$db\`.\`$table\` — ошибка переноса"
             fi
         done
 
@@ -518,10 +527,29 @@ migrate_data() {
     success "Перенос данных завершён"
 }
 
-# ── Шаг 4: Верификация ────────────────────────────────────────────────────────
+# ── Шаг 4: Создание Materialized View ────────────────────────────────────────
+# Создаём после переноса данных — иначе INSERT в таблицы-источники
+# триггернёт MV и данные окажутся продублированы в таблицах-приёмниках.
+
+apply_matviews() {
+    log "=== Шаг 4: Создание Materialized View ==="
+
+    for f in "$BACKUP_DIR/ddl/matviews/"*.sql; do
+        [ -f "$f" ] || continue
+        local fname db mvname
+        fname=$(basename "$f" .sql)
+        parse_filename "$fname" db mvname
+        add_on_cluster "$f"
+        apply_file "$f" "MATERIALIZED VIEW \`$db\`.\`$mvname\`"
+    done
+
+    success "Materialized View созданы"
+}
+
+# ── Шаг 5: Верификация ────────────────────────────────────────────────────────
 
 verify_migration() {
-    log "=== Шаг 4: Верификация ==="
+    log "=== Шаг 5: Верификация ==="
 
     local src="${OLD_CLUSTER_SHARDS[0]}"
     local total_ok=0 total_fail=0
@@ -595,10 +623,11 @@ main() {
     check_replication_macros
     create_backup_dir
 
-    export_ddl
-    apply_ddl
-    migrate_data
-    verify_migration
+    export_ddl      # Шаг 1: экспорт DDL со старого кластера
+    apply_ddl       # Шаг 2: базы → локальные таблицы → Distributed → словари → View
+    migrate_data    # Шаг 3: перенос данных (Distributed, ReplicatedMergeTree)
+    apply_matviews  # Шаг 4: Materialized View — после данных, чтобы не было дублей
+    verify_migration # Шаг 5: верификация count() по всем перенесённым таблицам
 
     success "=================================================="
     success "  Миграция завершена. Лог: $LOG_FILE"
