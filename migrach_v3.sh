@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# ClickHouse Cross-Cluster Migration Script (v5-Final)
+# ClickHouse Cross-Cluster Migration Script (v6 - Fixed Regex & Fail-Fast)
 # =============================================================================
+set -o pipefail  # Ошибка в конвейере (например, clickhouse-client) остановит скрипт
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 OLD_CLUSTER_HOST="localhost"
@@ -17,9 +18,10 @@ LOG_FILE="/var/log/clickhouse-migration.log"
 EXCLUDED_DATABASES="'system', 'information_schema', 'INFORMATION_SCHEMA', 'default'"
 SIZE_LIMIT_BYTES=$((100 * 1024 * 1024 * 1024))  # 100 GB
 
-# ── Аргументы ─────────────────────────────────────────────────────────────────
 TARGET_DB=""
 DRY_RUN=false
+
+# ── Аргументы ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --db)      TARGET_DB="$2"; shift 2 ;;
@@ -29,9 +31,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Логирование (строгое разделение) ──────────────────────────────────────────
+# ── Логирование ───────────────────────────────────────────────────────────────
 mkdir -p "$(dirname "$LOG_FILE")"
-: > "$LOG_FILE"  # Гарантированный сброс файла
+: > "$LOG_FILE"
 
 log_file()  { echo "$(date '+%Y-%m-%d %H:%M:%S.%3N') - $1" >> "$LOG_FILE"; }
 log_step()  { echo "$(date '+%Y-%m-%d %H:%M:%S.%3N') - $1" | tee -a "$LOG_FILE"; }
@@ -39,15 +41,13 @@ log_success(){ echo -e "\033[0;32m$(date '+%Y-%m-%d %H:%M:%S.%3N') - $1\033[0m" 
 log_warning(){ echo -e "\033[1;33m$(date '+%Y-%m-%d %H:%M:%S.%3N') - WARNING: $1\033[0m" | tee -a "$LOG_FILE"; }
 log_error()  { echo -e "\033[0;31m$(date '+%Y-%m-%d %H:%M:%S.%3N') - ERROR: $1\033[0m" | tee -a "$LOG_FILE"; exit 1; }
 
-# ── ClickHouse-запросы (через stdin, безопасное экранирование) ────────────────
+# ── ClickHouse-запросы (через stdin, без экранирования) ───────────────────────
 ch_query() {
   local host="$1" port="$2" query="$3"
-  # Очистка: убираем \r, сжимаем пробелы/переносы, обрезаем концы
   local clean_query
   clean_query=$(printf '%s' "$query" | tr -d '\r' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
-  
   log_file "CH_EXEC [${host}:${port}] -> ${clean_query:0:150}$( [ ${#clean_query} -gt 150 ] && echo '...')"
-  # Передача через pipe исключает проблемы с --query и экранированием
+  
   printf '%s\n' "$clean_query" | clickhouse-client \
     --host="$host" --port="$port" \
     --user="$CLICKHOUSE_USER" --password="$CLICKHOUSE_PASSWORD" \
@@ -58,12 +58,11 @@ ch_old() { ch_query "$OLD_CLUSTER_HOST" "$OLD_CLUSTER_PORT" "$1"; }
 
 ch_new() {
   if $DRY_RUN; then
-    log_file "[DRY-RUN] Пропускаем запрос на новом кластере: $1"
+    log_file "[DRY-RUN] Пропускаем запрос на новом кластере"
     return 0
   fi
-  # FAIL-FAST: если создание сущности падает → сразу выходим
   if ! ch_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT" "$1"; then
-    log_error "Ошибка выполнения запроса на новом кластере. Скрипт остановлен для предотвращения несогласованности."
+    log_error "Критическая ошибка на новом кластере. Скрипт остановлен для предотвращения несогласованности."
   fi
 }
 
@@ -112,7 +111,6 @@ export_ddl() {
     mkdir -p "$BACKUP_DIR/ddl/$db"
     ch_old "SHOW CREATE DATABASE \`$db\`" > "$BACKUP_DIR/ddl/$db/database.sql"
 
-    # Таблицы
     ch_old "SELECT name FROM system.tables WHERE database='$db' AND engine NOT LIKE '%View%' AND engine!='Dictionary'" \
       | while read -r tbl; do
         [ -z "$tbl" ] && continue
@@ -120,7 +118,6 @@ export_ddl() {
         ch_old "SHOW CREATE TABLE \`$db\`.\`$tbl\`" > "$BACKUP_DIR/ddl/$db/$tbl.sql"
       done
 
-    # Вью
     ch_old "SELECT name FROM system.tables WHERE database='$db' AND engine LIKE '%View%'" \
       | while read -r v; do
         [ -z "$v" ] && continue
@@ -128,7 +125,6 @@ export_ddl() {
         ch_old "SHOW CREATE TABLE \`$db\`.\`$v\`" > "$BACKUP_DIR/ddl/$db/$v.view.sql"
       done
 
-    # Словари
     ch_old "SELECT name FROM system.dictionaries WHERE database='$db'" \
       | while read -r d; do
         [ -z "$d" ] && continue
@@ -139,17 +135,17 @@ export_ddl() {
   log_success "Экспорт DDL завершён"
 }
 
-# ── Утилиты DDL (in-place редактирование, безопасно) ──────────────────────────
+# ── Утилиты DDL (ИСПРАВЛЕНО: разделитель # вместо |) ─────────────────────────
 convert_engine() {
   local file="$1"
   [ -f "$file" ] || return 1
 
   if grep -qiP "ENGINE\s*=\s*ReplicatedMergeTree" "$file"; then
     log_file "    ReplicatedMergeTree → '/clickhouse/{database}/{table}/'"
-    perl -i -pe "s|ENGINE\s*=\s*ReplicatedMergeTree\s*\(\s*'[^']*'\s*,\s*'[^']*'|ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')|i" "$file"
+    perl -i -pe "s#ENGINE\s*=\s*ReplicatedMergeTree\s*\(\s*'[^']*'\s*,\s*'[^']*'#ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')#i" "$file"
   elif grep -qiP "ENGINE\s*=\s*MergeTree" "$file"; then
     log_file "    MergeTree → '/clickhouse/{database}/{table}/{shard}/'"
-    perl -i -pe "s|ENGINE\s*=\s*MergeTree\s*\([^)]*\)|ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')|i" "$file"
+    perl -i -pe "s#ENGINE\s*=\s*MergeTree\s*\([^)]*\)#ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')#i" "$file"
   else
     log_file "    Движок не требует конвертации"
   fi
@@ -160,8 +156,8 @@ add_on_cluster() {
   [ -f "$file" ] || return 1
   grep -qi "ON CLUSTER" "$file" && return 0
   log_file "    Добавление ON CLUSTER $CLUSTER_NAME"
-  # Меняем только первую строку CREATE, чтобы не задеть тело VIEW/функций
-  perl -i -pe 's|^(CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?(?:TABLE|VIEW|DATABASE|DICTIONARY)\s+\S+)|$1 ON CLUSTER '"$CLUSTER_NAME"'|i; last' "$file"
+  # # вместо | предотвращает конфликт с (?:TABLE|VIEW|...)
+  perl -i -pe "s#^(CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?(?:TABLE|VIEW|DATABASE|DICTIONARY)\s+\S+)\$#\$1 ON CLUSTER $CLUSTER_NAME#i; last" "$file"
 }
 
 # ── Шаг 2: Применение DDL ─────────────────────────────────────────────────────
