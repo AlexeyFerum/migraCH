@@ -533,6 +533,37 @@ get_table_size() {
     echo "${size:-0}"
 }
 
+# Проверяет, одинаковы ли данные на всех нодах кластера для MergeTree-таблицы.
+# Использует cityHash64 через cluster() для сравнения хешей и счётчиков строк.
+# Возвращает 0 (true) если данные идентичны на всех нодах, 1 (false) иначе.
+check_data_identical_on_all_nodes() {
+    local db="$1"
+    local table="$2"
+
+    local result
+    result=$(ch_old "
+        WITH hashes AS (
+            SELECT
+                _host,
+                sum(cityHash64(*)) AS data_hash,
+                count()            AS row_count
+            FROM cluster('$CLUSTER_NAME', $db.$table)
+            GROUP BY _host
+        )
+        SELECT countIf(data_hash = min_hash AND row_count = min_count) = count()
+        FROM (
+            SELECT
+                data_hash,
+                row_count,
+                min(data_hash)  OVER () AS min_hash,
+                min(row_count)  OVER () AS min_count
+            FROM hashes
+        )
+    " 2>/dev/null | tr -d '[:space:]')
+
+    [ "${result:-0}" = "1" ]
+}
+
 migrate_data() {
     $DRY_RUN && { log_step "[DRY-RUN] Пропускаем Шаг 3 (перенос данных)"; return 0; }
     log_step "=== Шаг 3: Перенос данных ==="
@@ -541,8 +572,7 @@ migrate_data() {
     if [ -n "$TARGET_DB" ]; then
         databases="$TARGET_DB"
     else
-        databases=$(ch_old \
-            "SELECT name FROM system.databases
+        databases=$(ch_old             "SELECT name FROM system.databases
              WHERE name NOT IN ($EXCLUDED_DATABASES)")
     fi
 
@@ -551,54 +581,90 @@ migrate_data() {
     for db in $databases; do
         log_step "  База: \`$db\`"
 
+        # ── Distributed и ReplicatedMergeTree — основной путь ─────────────────
         local tables
-        tables=$(ch_old \
-            "SELECT name, engine FROM system.tables
+        tables=$(ch_old             "SELECT name, engine FROM system.tables
              WHERE database = '$db'
                AND engine IN ('Distributed', 'ReplicatedMergeTree')")
 
         while IFS=$'\t' read -r table engine; do
             [ -z "$table" ] && continue
-
-            # Проверка размера
-            local size
-            size=$(get_table_size "$db" "$table" "$engine")
-            if (( size > SIZE_LIMIT_BYTES )); then
-                local size_gb=$(( size / 1024 / 1024 / 1024 ))
-                log_warning "  ⏭ \`$db\`.\`$table\` [${size_gb} GB > 100 GB] — пропущено, требует ручного переноса"
-                LARGE_TABLES+=("${db}.${table}")
-                continue
-            fi
-
-            local count
-            count=$(ch_old \
-                "SELECT count() FROM \`$db\`.\`$table\`" \
-                2>/dev/null | tr -d '[:space:]')
-
-            if [ -z "$count" ] || [ "$count" = "0" ]; then
-                log_file "  \`$db\`.\`$table\` [$engine] — пусто, пропускаем"
-                continue
-            fi
-
-            log_step "  \`$db\`.\`$table\` [$engine] — $count строк, переносим..."
-
-            if ch_new "
-                INSERT INTO \`$db\`.\`$table\`
-                SELECT * FROM remote(
-                    '$OLD_CLUSTER_HOST:$OLD_CLUSTER_PORT',
-                    \`$db\`, \`$table\`,
-                    '$OLD_CLICKHOUSE_USER', '$OLD_CLICKHOUSE_PASSWORD'
-                )
-            "; then
-                log_file "  ✓ \`$db\`.\`$table\` перенесена"
-            else
-                log_warning "  ✗ \`$db\`.\`$table\` — ошибка переноса (см. лог)"
-            fi
-
+            migrate_table "$db" "$table" "$engine" "single"
         done <<< "$tables"
+
+        # ── MergeTree без Distributed сверху — проверяем идентичность данных ──
+        # Такие таблицы могут содержать одинаковые данные на всех нодах
+        # (фактически реплицированные, но созданные без ReplicatedMergeTree).
+        local mt_tables
+        mt_tables=$(ch_old             "SELECT name FROM system.tables
+             WHERE database = '$db'
+               AND engine = 'MergeTree'
+               AND name NOT IN (
+                   SELECT local_table FROM (
+                       SELECT extract(engine_full, '\'([^\']+)\'', 2) AS local_table
+                       FROM system.tables
+                       WHERE database = '$db' AND engine = 'Distributed'
+                   )
+               )")
+
+        for table in $mt_tables; do
+            [ -z "$table" ] && continue
+
+            log_step "  Проверка MergeTree \`$db\`.\`$table\` — нет Distributed сверху"
+
+            if check_data_identical_on_all_nodes "$db" "$table"; then
+                log_warning "  ⚠ \`$db\`.\`$table\`: данные ОДИНАКОВЫ на всех нодах — таблица должна быть ReplicatedMergeTree. Переносим с одной ноды."
+                SUSPECT_TABLES+=("${db}.${table}")
+                migrate_table "$db" "$table" "MergeTree_replicated" "single"
+            else
+                log_warning "  ⚠ \`$db\`.\`$table\`: данные РАЗНЫЕ на нодах, Distributed отсутствует — таблица пропущена, требует ручного переноса."
+                SUSPECT_TABLES+=("${db}.${table} [РАЗНЫЕ ДАННЫЕ — пропущено]")
+            fi
+        done
+
     done
 
     log_success "Перенос данных завершён"
+}
+
+# Переносит данные одной таблицы на новый кластер.
+# engine_hint = "MergeTree_replicated" означает что MergeTree трактуем как реплицированную.
+migrate_table() {
+    local db="$1"
+    local table="$2"
+    local engine="$3"
+
+    local size
+    size=$(get_table_size "$db" "$table" "$engine")
+    if (( size > SIZE_LIMIT_BYTES )); then
+        local size_gb=$(( size / 1024 / 1024 / 1024 ))
+        log_warning "  ⏭ \`$db\`.\`$table\` [${size_gb} GB > 100 GB] — пропущено, требует ручного переноса"
+        LARGE_TABLES+=("${db}.${table}")
+        return
+    fi
+
+    local count
+    count=$(ch_old         "SELECT count() FROM \`$db\`.\`$table\`"         2>/dev/null | tr -d '[:space:]')
+
+    if [ -z "$count" ] || [ "$count" = "0" ]; then
+        log_file "  \`$db\`.\`$table\` [$engine] — пусто, пропускаем"
+        return
+    fi
+
+    log_step "  \`$db\`.\`$table\` [$engine] — $count строк, переносим..."
+
+    if ch_new "
+        INSERT INTO \`$db\`.\`$table\`
+        SELECT * FROM remote(
+            '$OLD_CLUSTER_HOST:$OLD_CLUSTER_PORT',
+            \`$db\`, \`$table\`,
+            '$OLD_CLICKHOUSE_USER', '$OLD_CLICKHOUSE_PASSWORD'
+        )
+    "; then
+        log_file "  ✓ \`$db\`.\`$table\` перенесена"
+    else
+        log_warning "  ✗ \`$db\`.\`$table\` — ошибка переноса (см. лог)"
+    fi
 }
 
 # ── Шаг 4: Создание Materialized View ────────────────────────────────────────
@@ -693,6 +759,7 @@ verify_migration() {
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 LARGE_TABLES=()
+SUSPECT_TABLES=()
 
 main() {
     log_step "=================================================="
@@ -725,6 +792,16 @@ main() {
         for t in "${LARGE_TABLES[@]}"; do
             log_warning "    - $t"
         done
+    fi
+
+    if [ ${#SUSPECT_TABLES[@]} -gt 0 ]; then
+        log_warning ""
+        log_warning "⚠️  Следующие MergeTree-таблицы не имеют Distributed сверху и требуют проверки:"
+        for t in "${SUSPECT_TABLES[@]}"; do
+            log_warning "    - $t"
+        done
+        log_warning "   Рекомендация: убедитесь что эти таблицы действительно должны быть ReplicatedMergeTree"
+        log_warning "   и проверьте корректность перенесённых данных вручную."
     fi
 
     log_success "=================================================="
