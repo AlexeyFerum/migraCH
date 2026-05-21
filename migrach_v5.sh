@@ -315,84 +315,84 @@ export_ddl() {
     log_success "Экспорт DDL завершён"
 }
 
-# ── Безопасная модификация файлов ─────────────────────────────────────────────
+# ── Подготовка DDL-файла ──────────────────────────────────────────────────────
 #
-# Перед модификацией создаём .bak.
-# После — проверяем что файл не стал пустым.
-# При опустошении — восстанавливаем из бэкапа и останавливаем скрипт.
-# Используем perl -i (правка файла напрямую) — без промежуточных переменных,
-# это исключает потерю содержимого через echo "$var" > file.
+# SHOW CREATE возвращает одну строку с литеральными \n (два символа: \ и n).
+# prepare_ddl_file делает три вещи последовательно через sed:
+#
+#   1. Раскрывает литеральные \n в реальные переносы строк
+#   2. Добавляет ON CLUSTER <name> после имени сущности (если ещё нет)
+#   3. Конвертирует движок (только для таблиц):
+#        MergeTree(...)           → ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')
+#        ReplicatedMergeTree(...) → ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')
+#
+# {database}, {table}, {shard}, {replica} — макросы ClickHouse,
+# передаются как литеральные строки, bash их не подставляет.
+#
+# Все правки делаются через sed -i (in-place, без промежуточных переменных).
+# Перед правкой создаётся .bak; если файл опустел — восстанавливаем и падаем.
 
-safe_modify() {
+prepare_ddl_file() {
     local file="$1"
-    local modifier_name="$2"
-    shift 2
-    # $@ — команда perl -i ... которую нужно выполнить
+    local kind="$2"   # database | table | distributed | dictionary | view | matview
 
-    [ -f "$file" ]  || log_error "safe_modify: файл не найден: $file"
-    [ -s "$file" ]  || log_error "safe_modify: файл пустой перед $modifier_name: $file"
+    [ -f "$file" ] || log_error "prepare_ddl_file: файл не найден: $file"
+    [ -s "$file" ] || log_error "prepare_ddl_file: файл пустой: $file"
 
     local bak="${file}.bak"
     cp -f "$file" "$bak"
 
-    "$@"
+    # ── 1. Литеральные \n → реальные переносы строк ───────────────────────────
+    sed -i 's/\\n/\n/g' "$file"
 
+    # ── 2. ON CLUSTER ─────────────────────────────────────────────────────────
+    # Вставляем ON CLUSTER сразу после имени сущности в backtick-кавычках.
+    # Паттерны для каждого типа — явные, без универсального regex.
+    if ! grep -qi "ON CLUSTER" "$file"; then
+        case "$kind" in
+            database)
+                sed -i "s/\(CREATE DATABASE \`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                ;;
+            table|distributed)
+                sed -i "s/\(CREATE TABLE \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                ;;
+            dictionary)
+                sed -i "s/\(CREATE DICTIONARY \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                ;;
+            view)
+                sed -i "s/\(CREATE VIEW \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                ;;
+            matview)
+                sed -i "s/\(CREATE MATERIALIZED VIEW \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                ;;
+        esac
+        log_file "    ON CLUSTER $CLUSTER_NAME добавлен"
+    fi
+
+    # ── 3. Конвертация движков (только для локальных таблиц) ──────────────────
+    if [ "$kind" = "table" ]; then
+        if grep -qi "ENGINE = ReplicatedMergeTree" "$file"; then
+            log_file "    ReplicatedMergeTree → '/clickhouse/{database}/{table}/'"
+            sed -i "s|ENGINE = ReplicatedMergeTree('[^']*', '[^']*'|ENGINE = ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}'|I" "$file"
+
+        elif grep -qi "ENGINE = MergeTree" "$file"; then
+            log_file "    MergeTree → '/clickhouse/{database}/{table}/{shard}/'"
+            # Покрываем все варианты: MergeTree / MergeTree() / MergeTree(args)
+            sed -i 's|ENGINE = MergeTree([^)]*)|ENGINE = ReplicatedMergeTree('"'"'/clickhouse/{database}/{table}/{shard}/'"'"', '"'"'{replica}'"'"')|I' "$file"
+            sed -i 's|ENGINE = MergeTree[[:space:]]*$|ENGINE = ReplicatedMergeTree('"'"'/clickhouse/{database}/{table}/{shard}/'"'"', '"'"'{replica}'"'"')|I' "$file"
+
+        else
+            log_file "    Движок не требует конвертации"
+        fi
+    fi
+
+    # ── Проверка что файл не опустел ──────────────────────────────────────────
     if [ ! -s "$file" ]; then
-        log_error "ФАТАЛЬНО: $file опустел после $modifier_name — восстановлен из бэкапа"
         mv -f "$bak" "$file"
+        log_error "ФАТАЛЬНО: $file опустел после prepare_ddl_file — восстановлен из бэкапа"
     else
         rm -f "$bak"
     fi
-}
-
-# ── Конвертация движков ───────────────────────────────────────────────────────
-#
-# Правила:
-#   MergeTree(...)           → ReplicatedMergeTree('/clickhouse/{database}/{table}/{shard}/', '{replica}')
-#   ReplicatedMergeTree(...) → ReplicatedMergeTree('/clickhouse/{database}/{table}/', '{replica}')
-#   Всё остальное            — без изменений
-#
-# {database}, {table}, {shard}, {replica} — макросы ClickHouse,
-# передаются как литеральные строки, bash их не подставляет.
-
-convert_engine() {
-    local file="$1"
-    [ -f "$file" ] || return 1
-
-    if grep -qiP "ENGINE\s*=\s*ReplicatedMergeTree" "$file"; then
-        log_file "    ReplicatedMergeTree → '/clickhouse/{database}/{table}/'"
-        safe_modify "$file" "convert_engine" \
-            perl -i -pe \
-            's#ENGINE\s*=\s*ReplicatedMergeTree\s*\(\s*'"'"'[^'"'"']*'"'"'\s*,\s*'"'"'[^'"'"']*'"'"'#ENGINE = ReplicatedMergeTree('"'"'/clickhouse/{database}/{table}/'"'"', '"'"'{replica}'"'"'#i' \
-            "$file"
-
-    elif grep -qiP "ENGINE\s*=\s*MergeTree" "$file"; then
-        log_file "    MergeTree → '/clickhouse/{database}/{table}/{shard}/'"
-        safe_modify "$file" "convert_engine" \
-            perl -i -pe \
-            's#ENGINE\s*=\s*MergeTree\s*\([^)]*\)#ENGINE = ReplicatedMergeTree('"'"'/clickhouse/{database}/{table}/{shard}/'"'"', '"'"'{replica}'"'"')#i' \
-            "$file"
-
-    else
-        log_file "    Движок не требует конвертации"
-    fi
-}
-
-# ── Добавление ON CLUSTER ─────────────────────────────────────────────────────
-
-add_on_cluster() {
-    local file="$1"
-    [ -f "$file" ] || return 1
-
-    grep -qi "ON CLUSTER" "$file" && return 0
-
-    log_file "    Добавление ON CLUSTER $CLUSTER_NAME"
-
-    # Паттерн матчит имя сущности в backtick-кавычках — надёжно для любых имён
-    safe_modify "$file" "add_on_cluster" \
-        perl -i -pe \
-        "s|(CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?(?:TABLE|VIEW|DATABASE|DICTIONARY)\s+\`[^\`]+\`)|\$1 ON CLUSTER ${CLUSTER_NAME}|i; last" \
-        "$file"
 }
 
 # ── Применить DDL-файл на новом кластере ─────────────────────────────────────
@@ -431,7 +431,7 @@ apply_ddl() {
         db=$(basename "$f" .sql)
         [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
 
-        add_on_cluster "$f"
+        prepare_ddl_file "$f" "database"
         log_file "  CREATE DATABASE \`$db\`"
         apply_file "$f" "DATABASE \`$db\`" true
     done
@@ -446,8 +446,7 @@ apply_ddl() {
         [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
 
         log_file "  Подготовка: \`$db\`.\`$tname\`"
-        convert_engine "$f"
-        add_on_cluster "$f"
+        prepare_ddl_file "$f" "table"
         apply_file "$f" "TABLE \`$db\`.\`$tname\`" true
     done
 
@@ -460,7 +459,7 @@ apply_ddl() {
         parse_filename "$fname" db tname
         [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
 
-        add_on_cluster "$f"
+        prepare_ddl_file "$f" "distributed"
         apply_file "$f" "DISTRIBUTED \`$db\`.\`$tname\`" true
     done
 
@@ -473,7 +472,7 @@ apply_ddl() {
         parse_filename "$fname" db dname
         [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
 
-        add_on_cluster "$f"
+        prepare_ddl_file "$f" "dictionary"
         apply_file "$f" "DICTIONARY \`$db\`.\`$dname\`" false
     done
 
@@ -486,7 +485,7 @@ apply_ddl() {
         parse_filename "$fname" db vname
         [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
 
-        add_on_cluster "$f"
+        prepare_ddl_file "$f" "view"
         apply_file "$f" "VIEW \`$db\`.\`$vname\`" false
     done
 
@@ -613,7 +612,7 @@ apply_matviews() {
         parse_filename "$fname" db mvname
         [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
 
-        add_on_cluster "$f"
+        prepare_ddl_file "$f" "matview"
         apply_file "$f" "MATERIALIZED VIEW \`$db\`.\`$mvname\`" false
     done
 
