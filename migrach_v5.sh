@@ -342,28 +342,32 @@ prepare_ddl_file() {
     local bak="${file}.bak"
     cp -f "$file" "$bak"
 
-    # ── 1. Литеральные \n → реальные переносы строк ───────────────────────────
+    # ── 1. Раскрываем литеральные escape-последовательности ─────────────────────
+    # SHOW CREATE возвращает \n и \' как два символа — раскрываем в реальные.
     sed -i 's/\\n/\n/g' "$file"
+    sed -i "s/\\\\'/'/g" "$file"
 
     # ── 2. ON CLUSTER ─────────────────────────────────────────────────────────
-    # Вставляем ON CLUSTER сразу после имени сущности в backtick-кавычках.
-    # Паттерны для каждого типа — явные, без универсального regex.
+    # После раскрытия \n имена сущностей — без backtick, вида: db.name или просто name.
+    # Паттерны явные для каждого типа, матчат первую строку файла (CREATE ...).
     if ! grep -qi "ON CLUSTER" "$file"; then
         case "$kind" in
             database)
-                sed -i "s/\(CREATE DATABASE \`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                # CREATE DATABASE db
+                sed -i "1s/\(CREATE DATABASE [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             table|distributed)
-                sed -i "s/\(CREATE TABLE \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                # CREATE TABLE db.name  или  CREATE TABLE db.name (IF NOT EXISTS)
+                sed -i "1s/\(CREATE TABLE [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             dictionary)
-                sed -i "s/\(CREATE DICTIONARY \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE DICTIONARY [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             view)
-                sed -i "s/\(CREATE VIEW \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE VIEW [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             matview)
-                sed -i "s/\(CREATE MATERIALIZED VIEW \`[^\`]*\`\.\`[^\`]*\`\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE MATERIALIZED VIEW [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
         esac
         log_file "    ON CLUSTER $CLUSTER_NAME добавлен"
