@@ -544,7 +544,7 @@ check_data_identical_on_all_nodes() {
     result=$(ch_old "
         WITH hashes AS (
             SELECT
-                _host,
+                hostname() as _host,
                 sum(cityHash64(*)) AS data_hash,
                 count()            AS row_count
             FROM cluster('$CLUSTER_NAME', $db.$table)
@@ -664,7 +664,7 @@ migrate_table() {
 
     if ch_new "
         INSERT INTO \`$db\`.\`$table\`
-        SELECT * FROM remote(
+        SELECT * FROM remoteSecure(
             '$OLD_CLUSTER_HOST:$OLD_CLUSTER_PORT',
             \`$db\`, \`$table\`,
             '$OLD_CLICKHOUSE_USER', '$OLD_CLICKHOUSE_PASSWORD'
