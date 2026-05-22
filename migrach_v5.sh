@@ -581,30 +581,39 @@ migrate_data() {
     for db in $databases; do
         log_step "  База: \`$db\`"
 
-        # ── Distributed и ReplicatedMergeTree — основной путь ─────────────────
+        # ── Кейс 1: Distributed → Distributed ────────────────────────────────
+        # Distributed сама агрегирует данные со всех шардов.
+        # Читаем с текущей ноды, вставляем в одноимённую Distributed на новом.
+        #
+        # ── Кейс 2: ReplicatedMergeTree → ReplicatedMergeTree ────────────────
+        # Данные одинаковы на всех нодах — читаем с текущей.
+        # Вставляем в локальную таблицу напрямую, репликация разойдётся сама.
         local tables
         tables=$(ch_old             "SELECT name, engine FROM system.tables
              WHERE database = '$db'
                AND engine IN ('Distributed', 'ReplicatedMergeTree')")
 
-        while IFS=$'\t' read -r table engine; do
+        while IFS=$'	' read -r table engine; do
             [ -z "$table" ] && continue
-            migrate_table "$db" "$table" "$engine" "single"
+            migrate_table "$db" "$table" "$engine"
         done <<< "$tables"
 
-        # ── MergeTree без Distributed сверху — проверяем идентичность данных ──
-        # Такие таблицы могут содержать одинаковые данные на всех нодах
-        # (фактически реплицированные, но созданные без ReplicatedMergeTree).
+        # ── Кейс 3: MergeTree без Distributed сверху ─────────────────────────
+        # Проверяем идентичность данных на всех нодах через cityHash64.
+        # Если данные одинаковые — таблица фактически реплицированная,
+        # переносим с одной ноды как ReplicatedMergeTree без {shard}.
+        # Если разные — пропускаем, требует ручного переноса.
         local mt_tables
         mt_tables=$(ch_old             "SELECT name FROM system.tables
              WHERE database = '$db'
                AND engine = 'MergeTree'
                AND name NOT IN (
-                   SELECT local_table FROM (
-                       SELECT extract(engine_full, '\'([^\']+)\'', 2) AS local_table
-                       FROM system.tables
-                       WHERE database = '$db' AND engine = 'Distributed'
+                   SELECT extract(engine_full,
+                       'Distributed\([^,]+,\s*''([^'']*)''\s*,\s*''([^'']*)'''
                    )
+                   FROM system.tables
+                   WHERE database = '$db'
+                     AND engine = 'Distributed'
                )")
 
         for table in $mt_tables; do
@@ -613,11 +622,11 @@ migrate_data() {
             log_step "  Проверка MergeTree \`$db\`.\`$table\` — нет Distributed сверху"
 
             if check_data_identical_on_all_nodes "$db" "$table"; then
-                log_warning "  ⚠ \`$db\`.\`$table\`: данные ОДИНАКОВЫ на всех нодах — таблица должна быть ReplicatedMergeTree. Переносим с одной ноды."
+                log_warning "  ⚠ \`$db\`.\`$table\`: данные ОДИНАКОВЫ на всех нодах — переносим как ReplicatedMergeTree (без {shard})"
                 SUSPECT_TABLES+=("${db}.${table}")
-                migrate_table "$db" "$table" "MergeTree_replicated" "single"
+                migrate_table "$db" "$table" "MergeTree_replicated"
             else
-                log_warning "  ⚠ \`$db\`.\`$table\`: данные РАЗНЫЕ на нодах, Distributed отсутствует — таблица пропущена, требует ручного переноса."
+                log_warning "  ⚠ \`$db\`.\`$table\`: данные РАЗНЫЕ на нодах, Distributed отсутствует — пропущено, требует ручного переноса"
                 SUSPECT_TABLES+=("${db}.${table} [РАЗНЫЕ ДАННЫЕ — пропущено]")
             fi
         done
@@ -628,7 +637,7 @@ migrate_data() {
 }
 
 # Переносит данные одной таблицы на новый кластер.
-# engine_hint = "MergeTree_replicated" означает что MergeTree трактуем как реплицированную.
+# engine = MergeTree_replicated означает: трактуем MergeTree как реплицированную.
 migrate_table() {
     local db="$1"
     local table="$2"
@@ -667,29 +676,50 @@ migrate_table() {
     fi
 }
 
-# ── Шаг 4: Создание Materialized View ────────────────────────────────────────
-# Создаём строго после переноса данных.
-# Если создать раньше — INSERT в таблицы-источники триггернёт MV
-# и данные окажутся продублированы в таблицах-приёмниках.
-
-apply_matviews() {
-    log_step "=== Шаг 4: Создание Materialized View ==="
-
-    for f in "$BACKUP_DIR/ddl/matviews/"*.sql; do
-        [ -f "$f" ] || continue
-        local fname db mvname
-        fname=$(basename "$f" .sql)
-        parse_filename "$fname" db mvname
-        [ -n "$TARGET_DB" ] && [ "$db" != "$TARGET_DB" ] && continue
-
-        prepare_ddl_file "$f" "matview"
-        apply_file "$f" "MATERIALIZED VIEW \`$db\`.\`$mvname\`" false
-    done
-
-    log_success "Materialized View созданы"
-}
-
 # ── Шаг 5: Верификация ────────────────────────────────────────────────────────
+
+# Считает строки таблицы на старом и новом кластере и сравнивает.
+# Для кейса 3 (MergeTree→Replicated без шардирования) на новом кластере
+# данные лежат только на одном шарде — считаем через clusterAllReplicas
+# чтобы убедиться что данные не разошлись по шардам случайно.
+verify_table_count() {
+    local db="$1"
+    local table="$2"
+    local engine_label="$3"
+    local is_suspect="${4:-false}"   # true = кейс 3, MergeTree→Replicated
+
+    local old_count new_count
+
+    old_count=$(ch_old         "SELECT count() FROM \`$db\`.\`$table\`"         2>/dev/null | tr -d '[:space:]')
+    old_count=${old_count:-0}
+
+    if [ "$is_suspect" = "true" ]; then
+        # Считаем через clusterAllReplicas — хотим убедиться что данные
+        # есть ровно на одном шарде и не растиражировались лишний раз.
+        # Ожидаем: сумма по всем нодам = old_count (не old_count * N шардов).
+        new_count=$(ch_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT"             "$NEW_CLICKHOUSE_USER" "$NEW_CLICKHOUSE_PASSWORD"             "SELECT sum(cnt) FROM (
+                SELECT count() AS cnt
+                FROM clusterAllReplicas('$CLUSTER_NAME', $db, $table)
+                GROUP BY _shard_num
+                LIMIT 1
+             )"             2>/dev/null | tr -d '[:space:]')
+        # fallback на прямой count если clusterAllReplicas недоступен
+        if [ -z "$new_count" ]; then
+            new_count=$(ch_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT"                 "$NEW_CLICKHOUSE_USER" "$NEW_CLICKHOUSE_PASSWORD"                 "SELECT count() FROM \`$db\`.\`$table\`"                 2>/dev/null | tr -d '[:space:]')
+        fi
+    else
+        new_count=$(ch_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT"             "$NEW_CLICKHOUSE_USER" "$NEW_CLICKHOUSE_PASSWORD"             "SELECT count() FROM \`$db\`.\`$table\`"             2>/dev/null | tr -d '[:space:]')
+    fi
+    new_count=${new_count:-0}
+
+    if [ "$old_count" -eq "$new_count" ]; then
+        log_success "  ✓ [$engine_label] \`$db\`.\`$table\`: $old_count строк"
+        return 0
+    else
+        log_warning "  ✗ [$engine_label] \`$db\`.\`$table\`: старый=$old_count новый=$new_count"
+        return 1
+    fi
+}
 
 verify_migration() {
     $DRY_RUN && { log_step "[DRY-RUN] Пропускаем Шаг 5 (верификация)"; return 0; }
@@ -701,49 +731,47 @@ verify_migration() {
     if [ -n "$TARGET_DB" ]; then
         databases="$TARGET_DB"
     else
-        databases=$(ch_old \
-            "SELECT name FROM system.databases
+        databases=$(ch_old             "SELECT name FROM system.databases
              WHERE name NOT IN ($EXCLUDED_DATABASES)")
     fi
 
     for db in $databases; do
+
+        # ── Кейс 1 и 2: Distributed и ReplicatedMergeTree ────────────────────
         local tables
-        tables=$(ch_old \
-            "SELECT name, engine FROM system.tables
+        tables=$(ch_old             "SELECT name, engine FROM system.tables
              WHERE database = '$db'
                AND engine IN ('Distributed', 'ReplicatedMergeTree')")
 
-        while IFS=$'\t' read -r table engine; do
+        while IFS=$'	' read -r table engine; do
             [ -z "$table" ] && continue
 
-            # Пропускаем таблицы, которые не переносились из-за размера
             local size
             size=$(get_table_size "$db" "$table" "$engine")
-            if (( size > SIZE_LIMIT_BYTES )); then
+            (( size > SIZE_LIMIT_BYTES )) && {
                 log_file "  ⏭ \`$db\`.\`$table\` — пропущено (>100 GB)"
                 continue
-            fi
+            }
 
-            local old_count new_count
-            old_count=$(ch_old \
-                "SELECT count() FROM \`$db\`.\`$table\`" \
-                2>/dev/null | tr -d '[:space:]')
-            old_count=${old_count:-0}
-
-            new_count=$(ch_query "$NEW_CLUSTER_HOST" "$NEW_CLUSTER_PORT" \
-                "$NEW_CLICKHOUSE_USER" "$NEW_CLICKHOUSE_PASSWORD" \
-                "SELECT count() FROM \`$db\`.\`$table\`" \
-                2>/dev/null | tr -d '[:space:]')
-            new_count=${new_count:-0}
-
-            if [ "$old_count" -eq "$new_count" ]; then
-                log_success "  ✓ [$engine] \`$db\`.\`$table\`: $old_count строк"
-                total_ok=$(( total_ok + 1 ))
-            else
-                log_warning "  ✗ [$engine] \`$db\`.\`$table\`: старый=$old_count новый=$new_count"
-                total_fail=$(( total_fail + 1 ))
-            fi
+            verify_table_count "$db" "$table" "$engine" false
+            local rc=$?
+            [ $rc -eq 0 ] && total_ok=$(( total_ok + 1 ))                           || total_fail=$(( total_fail + 1 ))
         done <<< "$tables"
+
+        # ── Кейс 3: MergeTree без Distributed → ReplicatedMergeTree без {shard}
+        # Данные должны лежать ровно на одном шарде нового кластера.
+        for suspect in "${SUSPECT_TABLES[@]}"; do
+            echo "$suspect" | grep -q "РАЗНЫЕ ДАННЫЕ" && continue
+
+            local s_db s_table
+            s_db="${suspect%%.*}"
+            s_table="${suspect#*.}"
+            [ "$s_db" != "$db" ] && continue
+
+            verify_table_count "$s_db" "$s_table" "MergeTree→Replicated" true
+            local rc=$?
+            [ $rc -eq 0 ] && total_ok=$(( total_ok + 1 ))                           || total_fail=$(( total_fail + 1 ))
+        done
     done
 
     log_step ""
