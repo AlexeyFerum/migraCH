@@ -354,20 +354,20 @@ prepare_ddl_file() {
         case "$kind" in
             database)
                 # CREATE DATABASE db
-                sed -i "1s/\(CREATE DATABASE IF NOT EXISTS [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE DATABASE\) \([^ ]*\)/\1 IF NOT EXISTS \2 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             table|distributed)
                 # CREATE TABLE db.name  или  CREATE TABLE db.name (IF NOT EXISTS)
-                sed -i "1s/\(CREATE TABLE IF NOT EXISTS [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE TABLE\) \([^ ]*\)/\1 IF NOT EXISTS \2 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             dictionary)
-                sed -i "1s/\(CREATE DICTIONARY IF NOT EXISTS [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE DICTIONARY\) \([^ ]*\)/\1 IF NOT EXISTS \2 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             view)
-                sed -i "1s/\(CREATE VIEW IF NOT EXISTS [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE VIEW\) \([^ ]*\)/\1 IF NOT EXISTS \2 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
             matview)
-                sed -i "1s/\(CREATE MATERIALIZED VIEW IF NOT EXISTS [^ ]*\)/\1 ON CLUSTER ${CLUSTER_NAME}/" "$file"
+                sed -i "1s/\(CREATE MATERIALIZED VIEW\) \([^ ]*\)/\1 IF NOT EXISTS \2 ON CLUSTER ${CLUSTER_NAME}/" "$file"
                 ;;
         esac
         log_file "    ON CLUSTER $CLUSTER_NAME добавлен"
